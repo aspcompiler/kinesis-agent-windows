@@ -12,46 +12,60 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.NetworkInformation;
-using System.Text;
-using System.Threading.Tasks;
-
-using Amazon.KinesisTap.Core;
-
-namespace Amazon.KinesisTap.Windows
+namespace Amazon.KinesisTap.Shared
 {
-    internal class WindowsNetworkStatus : INetworkStatus
+    using System;
+    using System.Linq;
+    using System.Net.NetworkInformation;
+    using System.Net.Sockets;
+    using Amazon.KinesisTap.Core;
+
+    /// <summary>
+    /// .net core version of NetworkStatus
+    /// </summary>
+    public class DefaultNetworkStatusProvider : INetworkStatusProvider, IIPV4Info
     {
         private bool _isAvailable;
 
-        public WindowsNetworkStatus()
+        public DefaultNetworkStatusProvider()
         {
             NetworkChange.NetworkAddressChanged += NetworkChange_NetworkAddressChanged;
             NetworkChange.NetworkAvailabilityChanged += NetworkChange_NetworkAvailabilityChanged;
-            _isAvailable = IsNetworkAvailable();
-
+            CheckNetworkAvailability();
         }
 
+        #region INetworkStatus members
         public bool IsAvailable()
         {
             return _isAvailable;
         }
 
+        public bool CanUpload(int priority)
+        {
+            return IsAvailable();
+        }
+
+        public bool CanDownload(int priority)
+        {
+            return IsAvailable();
+        }
+        #endregion
+
+        public string IpAddress { get; private set; }
+
+        public string SubnetMask { get; private set; }
 
         private void NetworkChange_NetworkAddressChanged(object sender, EventArgs e)
         {
-            _isAvailable = IsNetworkAvailable();
+            CheckNetworkAvailability();
         }
 
         private void NetworkChange_NetworkAvailabilityChanged(object sender, NetworkAvailabilityEventArgs e)
         {
-            _isAvailable = IsNetworkAvailable();
+            CheckNetworkAvailability();
         }
 
-        private bool IsNetworkAvailable()
+        private void CheckNetworkAvailability()
         {
             // only recognizes changes related to Internet adapters
             if (NetworkInterface.GetIsNetworkAvailable())
@@ -69,14 +83,28 @@ namespace Amazon.KinesisTap.Windows
                             if ((statistics.BytesReceived > 0) &&
                                 (statistics.BytesSent > 0))
                             {
-                                return true;
+                                _isAvailable = true;
+                                var ipProp = networkInterface.GetIPProperties();
+                                var ipInfo = ipProp.UnicastAddresses.FirstOrDefault(ip => ip.Address.AddressFamily == AddressFamily.InterNetwork);
+                                if (ipInfo == null)
+                                {
+                                    this.IpAddress = null;
+                                    this.SubnetMask = null;
+                                }
+                                else
+                                {
+                                    this.IpAddress = ipInfo.Address.ToString();
+                                    this.SubnetMask = ipInfo.IPv4Mask.ToString();
+                                }
+                                return;
                             }
                         }
                     }
                 }
             }
-            return false;
+            _isAvailable = false;
+            this.IpAddress = null;
+            this.SubnetMask = null;
         }
-
     }
 }

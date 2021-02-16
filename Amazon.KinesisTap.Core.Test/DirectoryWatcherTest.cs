@@ -15,20 +15,21 @@
 using System;
 using System.Linq;
 using Xunit;
-using Amazon.KinesisTap.Core;
 using Microsoft.Extensions.Logging;
 using System.IO;
-using System.Threading;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Configuration;
+using System.Globalization;
 
 namespace Amazon.KinesisTap.Core.Test
 {
     public class DirectoryWatcherTest
     {
-#region public members
+        private readonly BookmarkManager _bookmarkManager = new BookmarkManager();
+
+        #region public members
         [Fact]
         public void StartStopTest()
         {
@@ -36,12 +37,11 @@ namespace Amazon.KinesisTap.Core.Test
             using (MemoryLogger logger = new MemoryLogger("memory"))
             {
                 DirectorySource<string, LogContext> watcher = new DirectorySource<string, LogContext>(
-                    TestUtility.GetTestHome(), 
-                    filter, 
+                    TestUtility.GetTestHome(),
+                    filter,
                     1000,
-                    new PluginContext(null, logger, null), 
-                    new SingeLineRecordParser(), 
-                    DirectorySourceFactory.CreateLogSourceInfo);
+                    new PluginContext(null, logger, null, _bookmarkManager),
+                    new SingleLineRecordParser());
                 watcher.Start();
                 Assert.Equal($"DirectorySource id {null} watching directory {TestUtility.GetTestHome()} with filter {filter} started.", logger.LastEntry);
                 watcher.Stop();
@@ -58,9 +58,8 @@ namespace Amazon.KinesisTap.Core.Test
                     TestUtility.GetTestHome(),
                     null,
                     1000,
-                    new PluginContext(null, logger, null),
-                    new SingeLineRecordParser(),
-                    DirectorySourceFactory.CreateLogSourceInfo);
+                    new PluginContext(null, logger, null, _bookmarkManager),
+                    new SingleLineRecordParser());
                 watcher.Start();
                 Assert.Equal($"DirectorySource id {null} watching directory {TestUtility.GetTestHome()} with filter  started.", logger.LastEntry);
                 watcher.Stop();
@@ -68,6 +67,199 @@ namespace Amazon.KinesisTap.Core.Test
             }
         }
 
+        /// <summary>
+        /// Include Subdirectories Test
+        /// </summary>
+        /// <returns></returns>
+        [Fact]
+        public async Task IncludeSubdirectoriesTest()
+        {
+            var testName = "IncludeSubdirectoriesTest";
+            var filter = "*.*";
+            var subDir1 = "CPU";
+            var subDir2 = "Memory";
+
+            var directory = new TestDirectory(testName)
+            {
+                SubDirectories = new TestDirectory[]
+                {
+                     new TestDirectory(subDir1),
+                     new TestDirectory(subDir2)
+                }
+            };
+
+            var config = TestUtility.GetConfig("Sources", "IncludeSubdirectories");
+
+            await CreateAndRunWatcher(testName, filter, config, async (logRecords) =>
+            {
+                var filePath1 = Path.Combine(TestUtility.GetTestHome(), testName, subDir1, "test");
+                var filePath2 = Path.Combine(TestUtility.GetTestHome(), testName, subDir2, "test");
+
+                this.WriteLog(filePath1, "this is a test");
+                this.WriteLog(filePath2, "this is another test");
+                await Task.Delay(2000);
+
+                Assert.Equal(2, logRecords.Count);
+                var env1 = (ILogEnvelope)logRecords[0];
+                Assert.Equal("test", env1.FileName);
+                Assert.Equal(filePath1, env1.FilePath);
+
+                var env2 = (ILogEnvelope)logRecords[1];
+                Assert.Equal("test", env2.FileName);
+                Assert.Equal(filePath2, env2.FilePath);
+
+            }, new SingleLineRecordParser(), directory);
+        }
+
+        /// <summary>
+        /// Include MultipleLevel Subdirectories Test
+        /// </summary>
+        /// <returns></returns>
+        [Fact]
+        public async Task IncludeMultipleLevelSubdirectoriesTest()
+        {
+            var testName = "IncludeMultipleLevelSubdirectoriesTest";
+            var filter = "*.*";
+            var subDir1 = "CPU";
+            var subDir2 = "Memory";
+            var subDir3 = "CPU-1";
+
+            var directory = new TestDirectory(testName)
+            {
+                SubDirectories = new TestDirectory[]
+                {
+                     new TestDirectory(subDir1)
+                     {
+                         SubDirectories = new TestDirectory[] { new TestDirectory(subDir3) }
+                     },
+                     new TestDirectory(subDir2)
+                }
+            };
+
+            var config = TestUtility.GetConfig("Sources", "IncludeSubdirectories");
+
+            await CreateAndRunWatcher(testName, filter, config, async (logRecords) =>
+            {
+                var filePath1 = Path.Combine(Path.Combine(TestUtility.GetTestHome(), testName, subDir1), subDir3, "test");
+                var filePath2 = Path.Combine(TestUtility.GetTestHome(), testName, subDir2, "test");
+
+                this.WriteLog(filePath1, "test test");
+                this.WriteLog(filePath2, "test test test test test test test test test test test test test test");
+                await Task.Delay(2000);
+
+                Assert.Equal(2, logRecords.Count);
+                var env1 = (ILogEnvelope)logRecords[0];
+                Assert.Equal("test", env1.FileName);
+                Assert.Equal(filePath1, env1.FilePath);
+
+                var env2 = (ILogEnvelope)logRecords[1];
+                Assert.Equal("test", env2.FileName);
+                Assert.Equal(filePath2, env2.FilePath);
+
+            }, new SingleLineRecordParser(), directory);
+        }
+
+        /// <summary>
+        /// Include Subdirectories With "IncludeDirectoryFilter" Test
+        /// </summary>
+        /// <returns></returns>
+        [Fact]
+        public async Task IncludeSubdirectoriesWithIncludeDirectoryFilterTest()
+        {
+            var testName = "IncludeSubdirectoriesWithIncludeDirectoryFilterTest";
+            var filter = "*.*";
+            var subDir1 = "CPU";
+            var subDir2 = "Memory";
+            var subDir3 = "CPU-1";
+
+            var directory = new TestDirectory(testName)
+            {
+                SubDirectories = new TestDirectory[]
+                {
+                     new TestDirectory(subDir1),
+                     new TestDirectory(subDir2),
+                     new TestDirectory(subDir3)
+                }
+            };
+
+            var config = TestUtility.GetConfig("Sources", "IncludeSubdirectories");
+            config["IncludeDirectoryFilter"] = "CPU;Memory";
+            await CreateAndRunWatcher(testName, filter, config, async (logRecords) =>
+            {
+                var filePath1 = Path.Combine(TestUtility.GetTestHome(), testName, subDir1, "test");
+                var filePath2 = Path.Combine(TestUtility.GetTestHome(), testName, subDir2, "test");
+                var filePath3 = Path.Combine(TestUtility.GetTestHome(), testName, subDir3, "test");
+
+                this.WriteLog(filePath1, "test test test");
+                this.WriteLog(filePath2, "test test test test test test");
+                this.WriteLog(filePath3, "test test test test test test test test test");
+                await Task.Delay(2000);
+
+                Assert.Equal(2, logRecords.Count);
+                var env1 = (ILogEnvelope)logRecords[0];
+                Assert.Equal("test", env1.FileName);
+                Assert.Equal(filePath1, env1.FilePath);
+
+                var env2 = (ILogEnvelope)logRecords[1];
+                Assert.Equal("test", env2.FileName);
+                Assert.Equal(filePath2, env2.FilePath);
+
+            }, new SingleLineRecordParser(), directory);
+        }
+
+        /// <summary>
+        /// Include Subdirectories With "IncludeDirectoryFilter" With MultipleLevel Subdirectories Test
+        /// </summary>
+        /// <returns></returns>
+        [Fact]
+        public async Task IncludeSubdirectoriesWithIncludeDirectoryFilterWithMultipleLevelSubdirectoriesTest()
+        {
+            var testName = "IncludeSubdirectoriesWithIncludeDirectoryFilterWithMultipleLevelSubdirectoriesTest";
+            var filter = "*.*";
+            var subDir1 = "CPU";
+            var subDir2 = "Memory";
+            var subDir3 = "CPU-1";
+            var subDir4 = "Network";
+
+            var directory = new TestDirectory(testName)
+            {
+                SubDirectories = new TestDirectory[]
+                {
+                     new TestDirectory(subDir1)
+                     {
+                         SubDirectories = new TestDirectory[]{ new TestDirectory(subDir3) }
+                     },
+                     new TestDirectory(subDir2),
+                     new TestDirectory(subDir4)
+                }
+            };
+
+            var config = TestUtility.GetConfig("Sources", "IncludeSubdirectories");
+            config["IncludeDirectoryFilter"] = $@"CPU;CPU{Path.DirectorySeparatorChar}CPU-1";
+            await CreateAndRunWatcher(testName, filter, config, async (logRecords) =>
+            {
+                var filePath1 = Path.Combine(TestUtility.GetTestHome(), testName, subDir1, "test");
+                var filePath2 = Path.Combine(TestUtility.GetTestHome(), testName, subDir2, "test");
+                var filePath3 = Path.Combine(Path.Combine(TestUtility.GetTestHome(), testName, subDir1), subDir3, "test");
+                var filePath4 = Path.Combine(TestUtility.GetTestHome(), testName, subDir4, "test");
+
+                this.WriteLog(filePath1, "this is a test 1");
+                this.WriteLog(filePath2, "this is a test 2");
+                this.WriteLog(filePath3, "this is a test 3");
+                this.WriteLog(filePath4, "this is a test 4");
+                await Task.Delay(2000);
+
+                Assert.Equal(2, logRecords.Count);
+                var env1 = (ILogEnvelope)logRecords[0];
+                Assert.Equal("test", env1.FileName);
+                Assert.Equal(filePath1, env1.FilePath);
+
+                var env2 = (ILogEnvelope)logRecords[1];
+                Assert.Equal("test", env2.FileName);
+                Assert.Equal(filePath3, env2.FilePath);
+
+            }, new SingleLineRecordParser(), directory);
+        }
 
         /// <summary>
         /// Write to a single log file. New or existing.
@@ -145,6 +337,62 @@ namespace Amazon.KinesisTap.Core.Test
             });
         }
 
+        /// <summary>
+        /// xyz.log
+        /// xyz.log.1
+        /// xyz.log.2 ...
+        /// Latest has the highest number
+        /// </summary>
+        /// <returns></returns>
+        [Fact]
+        [Trait("Category", "Integration")]
+        public async Task RotatingFileNameWithLockTest()
+        {
+            string testName = "RotatingFileNameWithLockTest";
+            string logFileName = $"{testName}-{DateTime.UtcNow:yyyyMMddHHmmssfff}.log";
+            string filter = $"{logFileName}*";
+
+            using (var logger = new MemoryLogger(testName))
+            {
+                string filePath = Path.Combine(TestUtility.GetTestHome(), testName, logFileName);
+
+                await CreateAndRunWatcher(
+                    testName,
+                    filter,
+                    null,
+                    async (logRecords) =>
+                    {
+                        int accumulatedRecords = 0;
+                        WriteRandomRecords(filePath, out int records, out string lastLine1, GenerateSingleLineRecord);
+                        accumulatedRecords += records;
+                        string lastLine2 = null;
+                        using (var fs = RenameLogFile(filePath, true))
+                        {
+                            WriteRandomRecords(filePath, out records, out lastLine2, GenerateSingleLineRecord);
+                            accumulatedRecords += records;
+
+                            // Give it some time to fail before releasing the file lock.
+                            await Task.Delay(2000);
+                        }
+
+                        // Give it some time to succeed after releasing the file lock.
+                        await Task.Delay(3000);
+
+                        //Make sure that the last record of both batches are captured
+                        Assert.NotNull(logRecords.FirstOrDefault(l => lastLine1.Equals(l.GetMessage(null))));
+                        Assert.NotNull(logRecords.FirstOrDefault(l => lastLine2.Equals(l.GetMessage(null))));
+                        Assert.Equal(accumulatedRecords, logRecords.Count); //All records captured
+                    },
+                    new SingleLineRecordParser(),
+                    logger
+                );
+
+                // Ensure that the exception was encountered, so that we know the test handled it properly.
+                var exTest = $"System.IO.IOException: The process cannot access the file '{filePath}.00000001' because it is being used by another process.";
+                Assert.Contains(logger.Entries, i => i.StartsWith(exTest));
+            }
+        }
+
         [Fact]
         public async Task SingleLineRecordParserBlankLineTest()
         {
@@ -192,7 +440,7 @@ namespace Amazon.KinesisTap.Core.Test
 
             var config = TestUtility.GetConfig("Sources", "DHCPLog");
 
-            await CreateAndRunWatcher(testName, filter, config, async(logRecords) =>
+            await CreateAndRunWatcher(testName, filter, config, async (logRecords) =>
             {
                 string log = @"		Microsoft DHCP Service Activity Log
 
@@ -234,10 +482,10 @@ ID,Date,Time,Description,IP Address,Host Name,MAC Address,User Name, Transaction
                 Assert.Single(logRecords); //All records captured
                 var envelope = (ILogEnvelope)logRecords[0];
                 Assert.Equal(35, envelope.LineNumber);
-            }, new SingeLineRecordParser());
+            }, new SingleLineRecordParser());
         }
 
-        [Fact] 
+        [Fact]
         public async Task TimeStampedRecordTest()
         {
             string testName = "TimeStampedRecordTest";
@@ -312,25 +560,55 @@ ID,Date,Time,Description,IP Address,Host Name,MAC Address,User Name, Transaction
             }
             File.Move(filePath, $"{filePath}.{fileNum:D8}");
         }
-    
-        private async Task CreateAndRunWatcher(string testName, string filter, Func<List<IEnvelope>, Task> testBody)
+
+        private FileStream RenameLogFile(string filePath, bool withLock)
         {
-            await CreateAndRunWatcher(testName, filter, null, testBody, new SingeLineRecordParser());
+            string directory = Path.GetDirectoryName(filePath);
+            string fileName = Path.GetFileName(filePath);
+            string[] files = Directory.GetFiles(directory, fileName + "*");
+            string maxFile = files.Max();
+            int fileNum = 1;
+            if (!maxFile.Equals(filePath))
+            {
+                fileNum = int.Parse(maxFile.Substring(filePath.Length + 1)) + 1;
+            }
+            var newname = $"{filePath}.{fileNum:D8}";
+            File.Move(filePath, newname);
+            return new FileStream(newname, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         }
 
-        private async Task CreateAndRunWatcher<TData>(string testName, string filter, IConfiguration config, Func<List<IEnvelope>, Task> testBody, IRecordParser<TData, LogContext> recordParser)
+        private async Task CreateAndRunWatcher(string testName, string filter, Func<List<IEnvelope>, Task> testBody)
+        {
+            await CreateAndRunWatcher(testName, filter, null, testBody, new SingleLineRecordParser());
+        }
+
+        private async Task CreateAndRunWatcher<TData>(string testName, string filter, IConfiguration config, Func<List<IEnvelope>, Task> testBody, IRecordParser<TData, LogContext> recordParser, TestDirectory directory = null)
+        {
+            await this.CreateAndRunWatcher(testName, filter, config, testBody, recordParser, NullLogger.Instance, directory);
+        }
+
+        private async Task CreateAndRunWatcher<TData>(string testName, string filter, IConfiguration config, Func<List<IEnvelope>, Task> testBody, IRecordParser<TData, LogContext> recordParser, ILogger logger, TestDirectory directory = null)
         {
             //Create a distinct directory based on testName so that tests can run in parallel
             string testDir = Path.Combine(TestUtility.GetTestHome(), testName);
-            //The following will creates all directories and subdirectories in the specified path unless they already exist.
-            Directory.CreateDirectory(testDir);
 
-            //Clean up before the test rather than after so that we can inspect the files
-            DeleteFiles(testDir, "*.*");
+            if (directory == null)
+            {
+                //The following will creates all directories and subdirectories in the specified path unless they already exist.
+                Directory.CreateDirectory(testDir);
+
+                //Clean up before the test rather than after so that we can inspect the files
+                DeleteFiles(testDir, "*.*");
+            }
+            else
+            {
+                this.SetUpTestDirectory(directory, TestUtility.GetTestHome());
+            }
 
             ListEventSink logRecords = new ListEventSink();
+
             DirectorySource<TData, LogContext> watcher = new DirectorySource<TData, LogContext>
-                (testDir, filter, 1000, new PluginContext(config, NullLogger.Instance, null), recordParser, DirectorySourceFactory.CreateLogSourceInfo);
+                (testDir, filter, 1000, new PluginContext(config, logger, null, new BookmarkManager()), recordParser);
             watcher.Subscribe(logRecords);
             watcher.Start();
 
@@ -368,12 +646,12 @@ ID,Date,Time,Description,IP Address,Host Name,MAC Address,User Name, Transaction
 
         private string GenerateSingleLineRecord(DateTime timestamp)
         {
-            return timestamp.ToString("yyyyMMddhhmmssfff");
+            return timestamp.ToString("yyyyMMddhhmmssfff", CultureInfo.InvariantCulture);
         }
 
         private string GenerateMultiLineRecord(DateTime timestamp)
         {
-            return timestamp.ToString("MM/dd/yyyy HH:mm:ss" + ".fff") + Environment.NewLine + "Second Line." + Environment.NewLine + "Third Line.";
+            return timestamp.ToString("MM/dd/yyyy HH:mm:ss" + ".fff", CultureInfo.InvariantCulture) + Environment.NewLine + "Second Line." + Environment.NewLine + "Third Line.";
         }
 
         private string GetFileNameFromTimeStamp(string testName, string fileNameFormat)
@@ -383,7 +661,7 @@ ID,Date,Time,Description,IP Address,Host Name,MAC Address,User Name, Transaction
             return Path.Combine(TestUtility.GetTestHome(), testName, file); ;
         }
 
-        private void AddRecords<T> (List<T> logRecords, IList<T> newRecord)
+        private void AddRecords<T>(List<T> logRecords, IList<T> newRecord)
         {
             logRecords.AddRange(newRecord);
         }
@@ -396,13 +674,40 @@ ID,Date,Time,Description,IP Address,Host Name,MAC Address,User Name, Transaction
             }
         }
 
+        private void SetUpTestDirectory(TestDirectory directory, string parentPath)
+        {
+            string testDir = Path.Combine(parentPath, directory.Name);
+            Directory.CreateDirectory(testDir);
+            DeleteFiles(testDir, "*.*"); // needs to delete everything
+
+            if (directory.SubDirectories != null)
+            {
+                foreach (var dir in directory.SubDirectories)
+                {
+                    SetUpTestDirectory(dir, testDir);
+                }
+            }
+        }
+
         private static void DeleteFiles(string directory, string fileSpec)
         {
-            foreach(string f in Directory.EnumerateFiles(directory, fileSpec))
+            foreach (string f in Directory.EnumerateFiles(directory, fileSpec))
             {
                 File.Delete(f);
             }
         }
         #endregion
+
+        class TestDirectory
+        {
+            public TestDirectory(string name)
+            {
+                this.Name = name;
+            }
+
+            public string Name { get; set; }
+
+            public TestDirectory[] SubDirectories { get; set; }
+        }
     }
 }

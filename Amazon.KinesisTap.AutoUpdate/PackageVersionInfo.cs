@@ -23,7 +23,7 @@ namespace Amazon.KinesisTap.AutoUpdate
     /// </summary>
     public class PackageVersionInfo
     {
-        public string Name { get; set; }
+        public string Name { get; set; } = "KinesisTap";
         public string Version { get; set; }
         public string PackageUrl { get; set; }
     }

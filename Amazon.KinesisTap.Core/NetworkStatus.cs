@@ -12,10 +12,8 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
-using System;
 using System.Collections.Generic;
-using System.Net.NetworkInformation;
-using System.Text;
+using System.Linq;
 
 namespace Amazon.KinesisTap.Core
 {
@@ -23,8 +21,43 @@ namespace Amazon.KinesisTap.Core
     /// Provide access to network status.
     /// Due to lack of library in .net standard 1.3, the concrete class is supplied by platform specific start-up.
     /// </summary>
-    public static class NetworkStatus
+    public class NetworkStatus
     {
-        public static INetworkStatus CurrentNetwork { get; internal set; }
+        public NetworkStatus(INetworkStatusProvider defaultProvider)
+        {
+            DefaultProvider = defaultProvider;
+        }
+
+        private readonly List<INetworkStatusProvider> _addtionalNetworkStatusProviders = new List<INetworkStatusProvider>();
+
+        public INetworkStatusProvider DefaultProvider { get; }
+
+        public bool IsAvailable()
+        {
+            if (DefaultProvider?.IsAvailable() != true) return false;
+            return _addtionalNetworkStatusProviders.All(p => p.IsAvailable()); //All providers must indicate available
+        }
+
+        public bool CanUpload(int priority)
+        {
+            if (DefaultProvider?.CanUpload(priority) != true) return false;
+            return _addtionalNetworkStatusProviders.All(p => p.CanUpload(priority)); //All providers must indicate OK
+        }
+
+        public bool CanDownload(int priority)
+        {
+            if (DefaultProvider?.CanDownload(priority) != true) return false;
+            return _addtionalNetworkStatusProviders.All(p => p.CanDownload(priority)); //All providers must indicate OK
+        }
+
+        internal void RegisterNetworkStatusProvider(INetworkStatusProvider networkStatus)
+        {
+            _addtionalNetworkStatusProviders.Add(networkStatus);
+        }
+
+        internal void ResetNetworkStatusProviders()
+        {
+            _addtionalNetworkStatusProviders.Clear();
+        }
     }
 }

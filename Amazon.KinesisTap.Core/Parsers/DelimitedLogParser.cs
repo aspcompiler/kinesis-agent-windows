@@ -15,7 +15,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 using System.Text.RegularExpressions;
 
 namespace Amazon.KinesisTap.Core
@@ -28,6 +27,7 @@ namespace Amazon.KinesisTap.Core
         protected string _headers;
 
         public DelimitedLogParser(
+            IPlugInContext plugInContext,
             string delimiter,
             Func<string[], DelimitedLogContext, DelimitedLogRecord> recordFactoryMethod,
             string headerPattern,
@@ -35,12 +35,12 @@ namespace Amazon.KinesisTap.Core
             string commentPattern,
             string headers,
             DateTimeKind timeZoneKind
-        ) : base (delimiter, recordFactoryMethod, timeZoneKind)
+        ) : base(plugInContext, delimiter, recordFactoryMethod, timeZoneKind, null)
         {
             if (!string.IsNullOrWhiteSpace(headerPattern)) _headerRegex = new Regex(headerPattern);
             if (!string.IsNullOrWhiteSpace(recordPattern)) _recordRegex = new Regex(recordPattern);
             if (!string.IsNullOrWhiteSpace(commentPattern)) _commentRegex = new Regex(commentPattern);
-            if (!string.IsNullOrWhiteSpace(headers))  _headers = headers.Trim();
+            if (!string.IsNullOrWhiteSpace(headers)) _headers = headers.Trim();
         }
 
         public override IEnumerable<IEnvelope<DelimitedLogRecord>> ParseRecords(StreamReader sr, DelimitedLogContext context)

@@ -13,7 +13,6 @@
  * permissions and limitations under the License.
  */
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 // General Information about an assembly is controlled through the following
@@ -24,7 +23,7 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("Amazon")]
 [assembly: AssemblyProduct("Amazon Kinesis Agent for Microsoft Windows")]
-[assembly: AssemblyCopyright("Copyright © Amazon 2017-2018")]
+[assembly: AssemblyCopyright("Copyright © Amazon 2017-2020")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 
@@ -32,6 +31,7 @@ using System.Runtime.InteropServices;
 // to COM components.  If you need to access a type in this assembly from
 // COM, set the ComVisible attribute to true on that type.
 [assembly: ComVisible(false)]
+
 
 // The following GUID is for the ID of the typelib if this project is exposed to COM
 [assembly: Guid("1ce3ddd0-7fdc-4edf-86f0-c9592fc9e895")]
@@ -46,5 +46,5 @@ using System.Runtime.InteropServices;
 // You can specify all the values or you can default the Build and Revision Numbers
 // by using the '*' as shown below:
 // [assembly: AssemblyVersion("1.0.*")]
-[assembly: AssemblyVersion("1.1.158.1")]
-[assembly: AssemblyFileVersion("1.1.158.1")]
+[assembly: AssemblyVersion("1.1.216.5")]
+[assembly: AssemblyFileVersion("1.1.216.5")]

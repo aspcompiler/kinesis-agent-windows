@@ -12,18 +12,30 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
-using System;
-using System.Collections.Generic;
-using System.Text;
-
 namespace Amazon.KinesisTap.Core
 {
+    using System;
+    using System.IO;
+
     //Wrap around the underlying data to provide additional meta data
     public interface IEnvelope
     {
         DateTime Timestamp { get; }
 
         string GetMessage(string format);
+
+        /// <summary>
+        /// Serializes the data into a new <see cref="MemoryStream"/>.
+        /// </summary>
+        /// <param name="format">The format to use when writing.</param>
+        MemoryStream GetMessageStream(string format);
+
+        /// <summary>
+        /// Writes the data into an existing <see cref="MemoryStream"/>.
+        /// </summary>
+        /// <param name="format">The format to use when writing.</param>
+        /// <param name="memoryStream">The stream to write to.</param>
+        void WriteMessageToStream(string format, MemoryStream memoryStream);
 
         /// <summary>
         /// Resolve local variable. Local variable are defined as the variable only depends on the envelope. 
@@ -39,6 +51,16 @@ namespace Amazon.KinesisTap.Core
         /// <param name="variable"></param>
         /// <returns></returns>
         object ResolveMetaVariable(string variable);
+
+        /// <summary>
+        /// Gets or sets the bookmark position of the record.
+        /// </summary>
+        long Position { get; set; }
+
+        /// <summary>
+        /// Gets or sets the Id of the bookmark object registered in the <see cref="BookmarkManager"/>.
+        /// </summary>
+        int? BookmarkId { get; set; }
     }
 
     public interface IEnvelope<out TData> : IEnvelope

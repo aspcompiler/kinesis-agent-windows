@@ -12,6 +12,7 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
+using Microsoft.Extensions.Configuration;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -19,16 +20,24 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace Amazon.KinesisTap.Core
 {
     public static class Utility
     {
-        public static readonly bool IsWindow = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        // Cache the OS platform information
+        public static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        public static readonly bool IsMacOs = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+        public static readonly bool IsLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+        public static readonly string Platform = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows" :
+            RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "Linux" :
+            RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "macOS" : "Unknown";
+        public const string DefaultExtraConfigDirectoryName = "configs";
+
         public static Func<string, string> ResolveEnvironmentVariable = Environment.GetEnvironmentVariable; //Can override this function for different OS
 
         private static string _computerName;
@@ -45,6 +54,10 @@ namespace Amazon.KinesisTap.Core
             return _stopwatch.ElapsedMilliseconds;
         }
 
+        public static string AgentId { get; set; }
+
+        public static string UserId { get; set; }
+
         public static string ComputerName
         {
             get
@@ -56,7 +69,7 @@ namespace Amazon.KinesisTap.Core
                         //On Linux, system does not create environment variable for nologin users so use Dns.GetHostName();
                         //Dns.GetHostName on Linux eventually call gethostname() system function but it first check if socket exists.
                         //In later version of .net, can just use Environment.MachineName
-                        if (IsWindow)
+                        if (IsWindows)
                         {
                             _computerName = Environment.GetEnvironmentVariable("COMPUTERNAME");
                         }
@@ -82,7 +95,7 @@ namespace Amazon.KinesisTap.Core
                     try
                     {
                         //On Linux, Dns.GetHostEntryAsync("LocalHost") will return "LocalHost"
-                        _hostName = IsWindow ? Dns.GetHostEntryAsync("LocalHost").Result.HostName : Dns.GetHostName();
+                        _hostName = IsWindows ? Dns.GetHostEntryAsync("LocalHost").Result.HostName : Dns.GetHostName();
                     }
                     catch { }
                 }
@@ -266,25 +279,59 @@ namespace Amazon.KinesisTap.Core
             }
         }
 
-        //Should return something like c:\ProgramData\Amazon\KinesisTap
+        /// <summary>
+        /// Returns the ProgramData path, used to store bookmarks, logs, and update packages.
+        /// </summary>
         public static string GetKinesisTapProgramDataPath()
         {
             string kinesisTapProgramDataPath = Environment.GetEnvironmentVariable(ConfigConstants.KINESISTAP_PROGRAM_DATA);
             if (string.IsNullOrWhiteSpace(kinesisTapProgramDataPath))
             {
-                kinesisTapProgramDataPath = Path.Combine(Environment.GetEnvironmentVariable("ProgramData"), "Amazon\\AWSKinesisTap");
+                if (IsWindows)
+                {
+                    kinesisTapProgramDataPath = Path.Combine(Environment.GetEnvironmentVariable("ProgramData"), "Amazon\\KinesisTap");
+                }
+                else
+                {
+                    kinesisTapProgramDataPath = ConfigConstants.LINUX_DEFAULT_PROGRAM_DATA_PATH;
+                }
             }
             return kinesisTapProgramDataPath;
         }
 
+        /// <summary>
+        /// Returns the path to the directory that stores the appsettings.json configuration file.
+        /// </summary>
         public static string GetKinesisTapConfigPath()
         {
-            string kinesisTapConfigPath = Environment.GetEnvironmentVariable(ConfigConstants.KINESISTAP_COFIG_PATH);
+            string kinesisTapConfigPath = Environment.GetEnvironmentVariable(ConfigConstants.KINESISTAP_CONFIG_PATH);
             if (string.IsNullOrWhiteSpace(kinesisTapConfigPath))
             {
-                kinesisTapConfigPath = AppContext.BaseDirectory;
+                if (IsWindows)
+                {
+                    // For windows, use the installation path
+                    kinesisTapConfigPath = AppContext.BaseDirectory;
+                }
+                else
+                {
+                    kinesisTapConfigPath = ConfigConstants.LINUX_DEFAULT_CONFIG_PATH;
+                }
             }
             return kinesisTapConfigPath;
+        }
+
+        /// <summary>
+        /// Resolve the directory that contains the extra configuration files.
+        /// </summary>
+        public static string GetKinesisTapExtraConfigPath()
+        {
+            string kinesisTapChildConfigPath = Environment.GetEnvironmentVariable(ConfigConstants.KINESISTAP_EXTRA_CONFIG_DIR_PATH);
+            if (!string.IsNullOrWhiteSpace(kinesisTapChildConfigPath))
+            {
+                return kinesisTapChildConfigPath;
+            }
+
+            return Path.Combine(GetKinesisTapConfigPath(), DefaultExtraConfigDirectoryName);
         }
 
         public static string ProperCase(string constant)
@@ -334,6 +381,22 @@ namespace Amazon.KinesisTap.Core
             {
                 return datetime;
             }
+        }
+
+        /// <summary>
+        /// Parse the time zone kind from the configuration value.
+        /// </summary>
+        /// <param name="config"></param>
+        /// <returns>UTC (default) or Local DateTimeKind</returns>
+        public static DateTimeKind ParseTimeZoneKind(string config)
+        {
+            string timeZoneKindConfig = ProperCase(config);
+            DateTimeKind timeZoneKind = DateTimeKind.Utc;
+            if (!string.IsNullOrWhiteSpace(timeZoneKindConfig))
+            {
+                timeZoneKind = (DateTimeKind)Enum.Parse(typeof(DateTimeKind), timeZoneKindConfig);
+            }
+            return timeZoneKind;
         }
 
         /// <summary>
@@ -416,6 +479,16 @@ namespace Amazon.KinesisTap.Core
             return epoch.AddMilliseconds(epochTime);
         }
 
+        public static long ToEpochSeconds(DateTime utcTime)
+        {
+            return Convert.ToInt64((utcTime - epoch).TotalSeconds);
+        }
+
+        public static long ToEpochMilliseconds(DateTime utcTime)
+        {
+            return Convert.ToInt64((utcTime - epoch).TotalMilliseconds);
+        }
+
         /// <summary>
         /// Strip quotes from a string if it is quoted
         /// </summary>
@@ -424,7 +497,7 @@ namespace Amazon.KinesisTap.Core
         public static string StripQuotes(string value)
         {
             if (string.IsNullOrWhiteSpace(value)) return value;
-            
+
             if (value.StartsWith("'") || value.StartsWith("\""))
             {
                 return value.Substring(1, value.Length - 2);
@@ -442,6 +515,55 @@ namespace Amazon.KinesisTap.Core
         }
 
         private static readonly DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        /// <summary>
+        /// Exchange the value of a <see cref="Int64"/> field a comparand number is greater than that field.
+        /// This method is thread-safe.
+        /// </summary>
+        /// <param name="location">Reference to the field to exchange.</param>
+        /// <param name="value">Value to exchange.</param>
+        /// <param name="comparand">Comparand number</param>
+        /// <returns>The value in <paramref name="location"/> before exchanging</returns>
+        public static long InterlockedExchangeIfGreaterThan(ref long location, long value, long comparand)
+        {
+            long original;
+            do
+            {
+                // first we store the original value. Note that by the time this assignment completes, the value at location might already change
+                original = Interlocked.Read(ref location);
+                if (comparand <= original)
+                {
+                    // if the condition is not satisfied, we return the original
+                    return original;
+                }
+                // if the condition is met, we exchange the value if and only if the location value hasn't changed
+                // if the location value has changed, we simply retry, hence the while loop
+            }
+            while (Interlocked.CompareExchange(ref location, value, original) != original);
+            return original;
+        }
+
+        /// <summary>
+        /// A helper method that will return the value of the defaultValue parameter if the value is null, empty, or whitespace.
+        /// </summary>
+        /// <param name="value">The string value that is expected to be not null or whitespace.</param>
+        /// <param name="defaultValue">The default value to return if the value parameter is null or whitespace.</param>
+        public static string ValueOrDefault(string value, string defaultValue)
+        {
+            if (!string.IsNullOrWhiteSpace(value)) return value;
+            return defaultValue;
+        }
+
+        /// <summary>
+        /// A helper method that will throw an exception if a config property is null or whitespace.
+        /// </summary>
+        /// <param name="config">The <see cref="IConfiguration"/> to retrieve the property from.</param>
+        /// <param name="propertyName">The name of the property to retrieve.</param>
+        public static string GetRequiredConfigValue(IConfiguration config, string propertyName)
+        {
+            if (!string.IsNullOrWhiteSpace(config[propertyName])) return config[propertyName];
+            throw new ArgumentException($"Configuration property '{propertyName}' cannot be null or whitespace");
+        }
     }
 
     internal static class StringBuilderExtensions
@@ -491,7 +613,7 @@ namespace Amazon.KinesisTap.Core
         {
             return source
             .Select((x, i) => new { Index = i, Value = x })
-            .GroupBy(x => x.Index / 3)
+            .GroupBy(x => x.Index / chunkSize)
             .Select(x => x.Select(v => v.Value).ToList());
         }
     }

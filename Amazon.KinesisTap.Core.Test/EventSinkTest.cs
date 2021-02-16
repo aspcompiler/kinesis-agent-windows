@@ -25,6 +25,8 @@ namespace Amazon.KinesisTap.Core.Test
 {
     public class EventSinkTest
     {
+        private readonly BookmarkManager _bookmarkManager = new BookmarkManager();
+
         [Fact]
         public void TestUnsupportedFormat()
         {
@@ -39,7 +41,7 @@ namespace Amazon.KinesisTap.Core.Test
         [InlineData("TextDecorationEx")]
         public void TestTextDecoration(string sinkId)
         {
-            string id = sinkId + (Utility.IsWindow ? string.Empty : TestUtility.LINUX);
+            string id = sinkId + (Utility.IsWindows ? string.Empty : TestUtility.LINUX);
             MemoryLogger logger = new MemoryLogger(null);
             MockEventSource<string> mockEventSource = CreateEventsource<string>("InitialPositionUnspecified");
             MockEventSink sink = CreateEventSink(id, logger);
@@ -56,7 +58,7 @@ namespace Amazon.KinesisTap.Core.Test
         [InlineData("TextDecorationExWithFileName")]
         public void TextDecorationWithFileName(string sinkId)
         {
-            string id = sinkId + (Utility.IsWindow ? string.Empty : TestUtility.LINUX);
+            string id = sinkId + (Utility.IsWindows ? string.Empty : TestUtility.LINUX);
             MemoryLogger logger = new MemoryLogger(null);
             MockEventSource<string> mockEventSource = CreateEventsource<string>("InitialPositionUnspecified");
             MockEventSink sink = CreateEventSink(id, logger);
@@ -98,7 +100,7 @@ namespace Amazon.KinesisTap.Core.Test
 
         private class testClass
         {
-            public string myvar1 { get; set;}
+            public string myvar1 { get; set; }
             public string myvar2 { get; set; }
         }
 
@@ -135,11 +137,11 @@ namespace Amazon.KinesisTap.Core.Test
             MockEventSource<object> mockEventSource = CreateEventsource<object>("InitialPositionUnspecified");
             MockEventSink sink = CreateEventSink(sinkId, logger); //"TextDecoration": "{$myvar2}"
             mockEventSource.Subscribe(sink);
-            var data1 = new 
+            var data1 = new
             {
                 myvar1 = "myval1"
             };
-            var data2 = new 
+            var data2 = new
             {
                 myvar2 = "myval2"
             };
@@ -186,7 +188,7 @@ namespace Amazon.KinesisTap.Core.Test
         [InlineData("ObjectDecorationEx")]
         public void TestObjectDecoration(string sinkId)
         {
-            string id = sinkId + (Utility.IsWindow ? string.Empty : TestUtility.LINUX);
+            string id = sinkId + (Utility.IsWindows ? string.Empty : TestUtility.LINUX);
             MemoryLogger logger = new MemoryLogger(null);
             MockEventSource<IDictionary<string, string>> mockEventSource = CreateEventsource<IDictionary<string, string>>("InitialPositionUnspecified");
             MockEventSink sink = CreateEventSink(id, logger);
@@ -205,13 +207,13 @@ namespace Amazon.KinesisTap.Core.Test
         [InlineData("ObjectDecorationExWithFileName")]
         public void TestObjectDecorationWithFileName(string sinkId)
         {
-            string id = sinkId + (Utility.IsWindow ? string.Empty : TestUtility.LINUX);
+            string id = sinkId + (Utility.IsWindows ? string.Empty : TestUtility.LINUX);
             MemoryLogger logger = new MemoryLogger(null);
             MockEventSource<IDictionary<string, string>> mockEventSource = CreateEventsource<IDictionary<string, string>>("InitialPositionUnspecified");
             MockEventSink sink = CreateEventSink(id, logger);
             mockEventSource.Subscribe(sink);
             string text = "some text";
-            Dictionary<string, string> data = new Dictionary<string, string>() { {"data", text } };
+            Dictionary<string, string> data = new Dictionary<string, string>() { { "data", text } };
             DateTime timestamp = DateTime.UtcNow;
             string filePath = Path.Combine(TestUtility.GetTestHome(), "test.log");
             long position = 11;
@@ -239,6 +241,27 @@ namespace Amazon.KinesisTap.Core.Test
             Assert.Equal(data.ToString(Formatting.None), sink.Records[0]);
         }
 
+        /// <summary>
+        /// Customer requested that we make earlier attributes evaluated visible as a local variable to later attributes. This is the test.
+        /// </summary>
+        /// <param name="input"></param>
+        /// <param name="attribute"></param>
+        /// <param name="value"></param>
+        [Theory]
+        [InlineData("{ \"Message\": \"Info: MID 368937710 ICID 448324092 From: <bunny@acme.com>\" }", "Combined", "<bunny@acme.com>")]
+        [InlineData("{ \"Message\": \"Info: MID 118880431 ICID 198591155 RID 0 To: <tweety@acme.com>\" }", "Combined", "<tweety@acme.com>")]
+        public void TestObjectDecorationResolutionOrder(string input, string attribute, string value)
+        {
+            MemoryLogger logger = new MemoryLogger(null);
+            MockEventSource<JObject> mockEventSource = CreateEventsource<JObject>("InitialPositionUnspecified");
+            MockEventSink sink = CreateEventSink("ObjectDecorationExResolutionOrder", logger);
+            mockEventSource.Subscribe(sink);
+            DateTime timestamp = DateTime.UtcNow;
+            JObject data = JObject.Parse(input);
+            mockEventSource.MockEvent(data, timestamp);
+            Assert.Contains($"\"{attribute}\":\"{value}\"", sink.Records[0]);
+        }
+
         [Theory]
         [InlineData("ObjectDecorationExWithBadExpression")]
         [InlineData("ObjectDecorationExWithBadSyntax")]
@@ -248,17 +271,17 @@ namespace Amazon.KinesisTap.Core.Test
             Assert.ThrowsAny<Exception>(() => CreateEventSink(sinkId, logger));
         }
 
-        private static MockEventSink CreateEventSink(string id, ILogger logger)
+        private MockEventSink CreateEventSink(string id, ILogger logger)
         {
             var config = TestUtility.GetConfig("Sinks", id);
-            var source = new MockEventSink(new PluginContext(config, logger, null));
+            var source = new MockEventSink(new PluginContext(config, logger, null, _bookmarkManager));
             return source;
         }
 
-        private static MockEventSource<T> CreateEventsource<T>(string id)
+        private MockEventSource<T> CreateEventsource<T>(string id)
         {
             var config = TestUtility.GetConfig("Sources", id);
-            var source = new MockEventSource<T>(new PluginContext(config, null, null));
+            var source = new MockEventSource<T>(new PluginContext(config, null, null, _bookmarkManager));
             EventSource<T>.LoadCommonSourceConfig(config, source);
             return source;
         }
@@ -267,7 +290,7 @@ namespace Amazon.KinesisTap.Core.Test
         {
             get
             {
-                return Utility.IsWindow ? Utility.ComputerName : Utility.HostName;
+                return Utility.IsWindows ? Utility.ComputerName : Utility.HostName;
             }
         }
     }

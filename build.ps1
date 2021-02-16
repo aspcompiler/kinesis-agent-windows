@@ -1,4 +1,4 @@
-param (
+﻿param (
     [switch]$packageOnly = $false
 )
 
@@ -29,6 +29,7 @@ $stopwatch = New-Object System.Diagnostics.Stopwatch
 $stopwatch.Start()
 $VerbosePreference = "Continue"
 $InformationPreference = "Continue"
+$ErrorActionPreference = "Stop"
 
 $serviceName="AWSKinesisTap"
 Set-Location -Path "$PSScriptRoot"
@@ -37,23 +38,33 @@ $releaseDir = Join-Path -Path $projDir -ChildPath "bin\Release\"
 
 if (!$packageOnly)
 {
-    $sln = Join-Path -Path $PSScriptRoot -ChildPath "$serviceName.sln"
-    $vsVersions = "Professional", "Enterprise", "Community", "BuildTools"
-    foreach ( $vsVersion in $vsVersions ) 
-    { 
-        $msbuild = 'C:\Program Files (x86)\Microsoft Visual Studio\2017\' + $vsVersion + '\MSBuild\15.0\Bin\MSBuild'
-        if (Test-Path -Path $msbuild)
+    # try to use the environment-defined MSBuild if possible
+    $msbuild = Get-Command MSBuild.exe -ErrorAction Ignore | Select-Object -ExpandProperty Path
+    if($null -eq $msbuild)
+    {
+        $vsVersions = "Professional", "Enterprise", "Community", "BuildTools"
+        $yearMaps = @{ '2017' = '15.0'; '2019' = 'Current' }
+        foreach ($year in $yearMaps.Keys)
         {
-            break
+            foreach ( $vsVersion in $vsVersions ) 
+            { 
+                $msbuild = "C:\Program Files (x86)\Microsoft Visual Studio\$year\$vsVersion\MSBuild\$($yearMaps[$year])\Bin\MSBuild"
+                if (Test-Path -Path $msbuild)
+                {
+                    break
+                }
+            }
         }
     }
 
+    $sln = Join-Path -Path $PSScriptRoot -ChildPath "$serviceName.sln"
+    $msiBuildSln = Join-Path -Path $PSScriptRoot -ChildPath "KinesisTapMsiBuild.sln"
     $service = Get-Service -Name $serviceName -ErrorAction Ignore
 
     if ($service -and $service.Status -eq 'Running')
     {
         Stop-Service -Name $serviceName -Force
-        sleep -Milliseconds 2000
+        Start-Sleep -Milliseconds 2000
     }
 
     if (Test-Path -Path $releaseDir)
@@ -64,8 +75,9 @@ if (!$packageOnly)
 
     try
     {
-	    Write-Verbose 'Building agent'
-	    & "$msbuild" $sln /p:Configuration=Release /p:Platform="Any CPU"
+        Write-Verbose 'Building agent'
+        dotnet build $sln -c Release
+	    & "$msbuild" "$msiBuildSln" /p:Configuration=Release /p:Platform="x64"
     }
     catch
     {
@@ -121,8 +133,6 @@ Copy-Item "$ulsPlugInDir\Amazon.KinesisTap.Uls.???" "$releaseDir"
 Write-Verbose 'Copying Amazon.KinesisTap.AutoUpdate.??? and .pdb to bin\release'
 Copy-Item "$PSScriptRoot\Amazon.KinesisTap.AutoUpdate\bin\release\netstandard1.3\Amazon.KinesisTap.AutoUpdate.???" "$releaseDir" 
 
-
-
 Write-Verbose 'Fix LastWriteTime of each file: https://github.com/PowerShell/Microsoft.PowerShell.Archive/issues/55'
 FixLastWriteTime $releaseDir
 
@@ -156,7 +166,14 @@ $nuspec.Save("$chocolateyPackageDir\KinesisTap.nuspec")
 Write-Verbose 'Create chocolatey package'
 #Compress-Archive -Path "$chocolateyPackageDir\*" -DestinationPath "$chocolateyPackageDir.zip" -CompressionLevel Fastest
 #Rename-Item "$chocolateyPackageDir.zip"  "$chocolateyPackageName.nupkg"
-& nuget.exe pack "$chocolateyPackageDir\KinesisTap.nuspec" -OutputDirectory "$outputDir" -nopackageanalysis
+try
+{
+    & nuget.exe pack "$chocolateyPackageDir\KinesisTap.nuspec" -OutputDirectory "$outputDir" -nopackageanalysis
+}
+catch
+{
+    Write-Verbose "Could not build nupkg file: $_"
+}
 
 # Birdwatcher package file build
 $birdwatcherOutputDir = Join-Path -Path $projDir -ChildPath "Birdwatcher\bin"
@@ -170,13 +187,11 @@ if (Test-Path -Path $birdwatcherOutputDir)
 
 New-Item -ItemType Directory -Path $birdwatcherReleaseDir -Force
 
-Copy-Item -Path $msiFile -Destination "$(Join-Path -Path $birdwatcherReleaseDir -ChildPath 'KinesisTap.msi')"
+Copy-Item -Path $msiFile -Destination "$(Join-Path -Path $birdwatcherReleaseDir -ChildPath $serviceName'.msi')"
 Copy-Item -Path "$(Join-Path -Path $chocolateyTemplateDir 'tools\chocolateyinstall.ps1')" -Destination "$(Join-Path -Path $birdwatcherReleaseDir -ChildPath 'install.ps1')" 
 Copy-Item -Path "$(Join-Path -Path $chocolateyTemplateDir 'tools\chocolateyuninstall.ps1')" -Destination "$(Join-Path -Path $birdwatcherReleaseDir -ChildPath 'uninstall.ps1')"
 
 $birdwatcherZipFileName = $serviceName + ".zip"
 Compress-Archive -Path "$birdwatcherReleaseDir\*" -DestinationPath "$(Join-Path -Path $birdwatcherOutputDir -ChildPath $birdwatcherZipFileName)"
 
-$integrationTestPublishDir = "$env:TMP\KTIntegrationTest"
-
-Exit $LASTERRORCODE
+Exit $LASTEXITCODE

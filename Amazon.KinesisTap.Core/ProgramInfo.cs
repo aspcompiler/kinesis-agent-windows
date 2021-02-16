@@ -17,12 +17,16 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+using Microsoft.DotNet.PlatformAbstractions;
 
 namespace Amazon.KinesisTap.Core
 {
     public static class ProgramInfo
     {
-        private static Process _process = Process.GetCurrentProcess();
+        private static readonly Process _process = Process.GetCurrentProcess();
         private static double _prevProcessorTime;
         private static DateTime _prevSampleTime;
         private static double _cpuUsage;
@@ -40,6 +44,15 @@ namespace Amazon.KinesisTap.Core
         }
 
         /// <summary>
+        /// Gets the full version number of KinesisTap.
+        /// </summary>
+        /// <returns>String representing KinesisTap's full version number.</returns>
+        public static string GetVersionNumber()
+        {
+            return GetKinesisTapVersion().FileVersion;
+        }
+
+        /// <summary>
         /// Get the version of KinesisTap
         /// </summary>
         /// <returns></returns>
@@ -54,7 +67,13 @@ namespace Amazon.KinesisTap.Core
         /// </summary>
         public static string KinesisTapPath
         {
-            set { _kinesisTapPath = value; }
+            set
+            {
+                // Only allow code to set the property if the file actually exists.
+                // Otherwise, force the use of the auto-discover code in the getter.
+                if (File.Exists(value))
+                    _kinesisTapPath = value;
+            }
             get
             {
                 if (string.IsNullOrWhiteSpace(_kinesisTapPath))
@@ -62,7 +81,30 @@ namespace Amazon.KinesisTap.Core
                     string mainModulePath = _process.MainModule.FileName;
                     if (Path.GetFileName(mainModulePath).Equals(ConfigConstants.KINESISTAP_EXE_NAME, StringComparison.CurrentCultureIgnoreCase))
                     {
+                        // This happens when running as normal.
                         _kinesisTapPath = mainModulePath;
+                    }
+                    else if (Utility.IsLinux || Utility.IsMacOs)
+                    {
+                        // This happens when running tests on a developer machine (Linux/Mac).
+                        var netCorePath = Path.Combine(AppContext.BaseDirectory, ConfigConstants.KINESISTAP_CORE);
+                        if (File.Exists(netCorePath))
+                            _kinesisTapPath = netCorePath;
+                    }
+                    else if (File.Exists(ConfigConstants.KINESISTAP_STANDARD_PATH))
+                    {
+                        // This happens when running tests on a developer machine (Windows).
+                        _kinesisTapPath = ConfigConstants.KINESISTAP_STANDARD_PATH;
+                    }
+
+                    // If none of the above worked...
+                    if (string.IsNullOrWhiteSpace(_kinesisTapPath) || !File.Exists(_kinesisTapPath))
+                    {
+                        // This happens when running unit tests in CodeBuild (Windows container).
+                        // We'll try using the version of the assembly that this code exists in.
+                        var dllPath = Path.Combine(AppContext.BaseDirectory, "Amazon.KinesisTap.Core.dll");
+                        if (File.Exists(dllPath))
+                            _kinesisTapPath = dllPath;
                     }
                 }
                 return _kinesisTapPath;

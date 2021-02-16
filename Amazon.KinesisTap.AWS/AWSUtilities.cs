@@ -12,25 +12,28 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Text;
-
-using Amazon.CloudWatchLogs.Model;
-using Amazon.Runtime;
-using Amazon.Runtime.CredentialManagement;
-using Amazon.Util;
-using Microsoft.Extensions.Configuration;
-
-using Amazon.KinesisTap.Core;
-
 namespace Amazon.KinesisTap.AWS
 {
+    using System;
+    using System.Collections.Concurrent;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Reflection;
+    using System.Runtime.InteropServices;
+    using Amazon.CloudWatchLogs.Model;
+    using Amazon.KinesisTap.Core;
+    using Amazon.Runtime;
+    using Amazon.Runtime.CredentialManagement;
+    using Amazon.Util;
+    using Microsoft.DotNet.PlatformAbstractions;
+    using Microsoft.Extensions.Configuration;
+    using Microsoft.Extensions.Logging;
+
     public static class AWSUtilities
     {
+        private static readonly ConcurrentDictionary<Type, Type> awsClientConfigTypeCache = new ConcurrentDictionary<Type, Type>();
+        private static string _userAgent;
+
         public static string EvaluateAWSVariable(string variable)
         {
             if (!variable.StartsWith("{") || !variable.EndsWith("}"))
@@ -40,7 +43,7 @@ namespace Amazon.KinesisTap.AWS
             }
 
             (string prefix, string variableNoPrefix) = Utility.SplitPrefix(variable.Substring(1, variable.Length - 2), ':');
-            switch(variableNoPrefix.ToLower())
+            switch (variableNoPrefix.ToLower())
             {
                 case "instance_id":
                     return EC2InstanceMetadata.InstanceId;
@@ -52,7 +55,7 @@ namespace Amazon.KinesisTap.AWS
                         if (!variableNoPrefix.StartsWith("/")) variableNoPrefix = "/" + variableNoPrefix;
                         return EC2InstanceMetadata.GetData(variableNoPrefix);
                     }
-                    else if("ec2tag".Equals(prefix, StringComparison.CurrentCultureIgnoreCase))
+                    else if ("ec2tag".Equals(prefix, StringComparison.CurrentCultureIgnoreCase))
                     {
                         return EC2Utility.GetTagValue(variableNoPrefix);
                     }
@@ -82,13 +85,55 @@ namespace Amazon.KinesisTap.AWS
         /// <typeparam name="TAWSClient">The type of AWS Client</typeparam>
         /// <param name="context">Plug-in context</param>
         /// <returns>AWS Client</returns>
-        public static TAWSClient CreateAWSClient<TAWSClient>(IPlugInContext context) where TAWSClient : AmazonServiceClient
+        public static TAWSClient CreateAWSClient<TAWSClient>(IPlugInContext context, RegionEndpoint regionOverride = null) where TAWSClient : AmazonServiceClient
         {
             (AWSCredentials credential, RegionEndpoint region) = GetAWSCredentialsRegion(context);
-            TAWSClient awsClient;
-            awsClient = CreateAWSClient<TAWSClient>(credential, region);
-            awsClient.BeforeRequestEvent += AwsClient_BeforeRequestEvent;
+            if (regionOverride != null)
+                region = regionOverride;
+
+            var clientConfig = CreateAWSClientConfig<TAWSClient>(context, region);
+            var awsClient = (TAWSClient)Activator.CreateInstance(typeof(TAWSClient), credential, clientConfig);
+
+            var headers = new Dictionary<string, string> { [AWSSDKUtils.UserAgentHeader] = UserAgent };
+            if (context.Configuration[ConfigConstants.SINK_TYPE]?.ToLower() == AWSEventSinkFactory.CLOUD_WATCH_LOG_EMF)
+                headers.Add("x-amzn-logs-format", "Structured");
+
+            var customHeaderSection = context.Configuration.GetSection(ConfigConstants.CUSTOM_AWS_CLIENT_HEADERS);
+            if (customHeaderSection != null)
+            {
+                foreach (var customHeader in customHeaderSection.GetChildren())
+                    headers.Add(customHeader.Key, ResolveConfigVariable(customHeader.Value));
+            }
+
+            awsClient.BeforeRequestEvent += (sender, args) =>
+            {
+                if (args is WebServiceRequestEventArgs wsArgs)
+                {
+                    foreach (var kvp in headers)
+                        wsArgs.Headers[kvp.Key] = kvp.Value;
+                }
+            };
+
             return awsClient;
+        }
+
+        public static string ResolveConfigVariable(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return value;
+            }
+            return Utility.ResolveVariables(value, ConfigVariableEvaluator);
+        }
+
+        private static string ConfigVariableEvaluator(string variable)
+        {
+            var evaluated = Utility.ResolveVariable(variable);
+            if (string.IsNullOrEmpty(evaluated))
+            {
+                return evaluated;
+            }
+            return AWSUtilities.EvaluateAWSVariable(evaluated);
         }
 
         /// <summary>
@@ -120,9 +165,9 @@ namespace Amazon.KinesisTap.AWS
             string credentialRef = config[ConfigConstants.CREDENTIAL_REF];
             string accessKey = config[ConfigConstants.ACCESS_KEY];
             string secretKey = config[ConfigConstants.SECRET_KEY];
-            string region = config[ConfigConstants.REGION];
+            string region = ResolveConfigVariable(config[ConfigConstants.REGION]);
             string profileName = config[ConfigConstants.PROFILE_NAME];
-            string roleArn = config[ConfigConstants.ROLE_ARN];
+            string roleArn = ResolveConfigVariable(config[ConfigConstants.ROLE_ARN]);
             AWSCredentials credential = null;
             RegionEndpoint regionEndPoint = null;
 
@@ -165,6 +210,7 @@ namespace Amazon.KinesisTap.AWS
             //If roleARN is specified. Assume if from the credential loaded above
             if (!string.IsNullOrWhiteSpace(roleArn))
             {
+                ConfigureSTSRegionalEndpoint(config);
                 credential = new AssumeRoleAWSCredentials(credential, roleArn, $"KinesisTap-{Utility.ComputerName}");
             }
 
@@ -229,16 +275,117 @@ namespace Amazon.KinesisTap.AWS
             }
         }
 
-        private static string _userAgent;
-
-        private static void AwsClient_BeforeRequestEvent(object sender, RequestEventArgs args)
+        private static ClientConfig CreateAWSClientConfig<TAWSClient>(IPlugInContext context, RegionEndpoint region) where TAWSClient : AmazonServiceClient
         {
-            WebServiceRequestEventArgs wsArgs = args as WebServiceRequestEventArgs;
-            if (wsArgs != null)
+            // The previous mechanism for locating the ClientConfig implementation was a switch block
+            // containing all of the known cases that the Amazon.KinesisTap.AWS library referenced.
+            // However, this meant that any other SDK clients that were instantiated by other libraries
+            // were not able to use this code (e.g. if a plugin used Secrets Manager to store an API key). 
+            // We need to do this more dynamically if we want third party plugins to be able to use this.
+
+            // Get the type of the AWS client being created based on the type parameter,
+            // and get the corresponding ClientConfig type from the type cache. If it doesn't
+            // exist in the cache, do the discovery. Using a cache eliminates redundant loading of
+            // assemblies when multiple instances of the same client are created. Since each client
+            // may be configured differently, we can't cache the clients (or the configs) themselves,
+            // but we can cache the ClientConfig types, since they are readonly objects.
+            var configType = awsClientConfigTypeCache.GetOrAdd(typeof(TAWSClient), (type) =>
             {
-                string currentUserAgent = wsArgs.Headers[AWSSDKUtils.UserAgentHeader];
-                wsArgs.Headers[AWSSDKUtils.UserAgentHeader] = UserAgent;
+                // Identify the "ClientConfig" for the requested SDK client. We can use the SDK's class naming
+                // convention to identify this type, replacing the word "Client" with "Config" in the client's
+                // full type name. For example:
+                // Amazon.SecretsManager.AmazonSecretsManagerClient
+                // becomes
+                // Amazon.SecretsManager.AmazonSecretsManagerConfig
+                var configTypeName = type.FullName.Substring(0, type.FullName.IndexOf("Client")) + "Config";
+
+                // Identify the assembly's name. The only way we can do this in this version of .NET is to
+                // use the AssemblyQualifiedName and strip off the type's name from the front. For example:
+                // Amazon.SecretsManager.AmazonSecretsManagerClient, AWSSDK.SecretsManager, Version=3.3.0.0, Culture=neutral, PublicKeyToken=885c28607f98e604
+                // becomes
+                // AWSSDK.SecretsManager, Version=3.3.0.0, Culture=neutral, PublicKeyToken=885c28607f98e604
+                var assemblyName = type.AssemblyQualifiedName.Substring(type.FullName.Length + 1).Trim();
+
+                // Load the Assembly into an object.
+                var assembly = Assembly.Load(new AssemblyName(assemblyName));
+
+                // Get the ClientConfig type from the Assembly object.
+                return assembly.GetType(configTypeName);
+            });
+
+            // Use Activator to initialize a new instance of the client-specific ClientConfig.
+            var clientConfig = (ClientConfig)Activator.CreateInstance(configType);
+
+            // Set the region endpoint property. If the region parameter is null, discover it using
+            // the FallbackRegionFactory. This method will return null if it doesn't find anything,
+            // so we'll throw an Exception if that's the case (since we won't be able to send any data).
+            clientConfig.RegionEndpoint = region ?? FallbackRegionFactory.GetRegionEndpoint();
+            if (clientConfig.RegionEndpoint == null)
+            {
+                context.Logger?.LogError("The 'Region' property was not specified in the configuration, and the agent was unable to discover it automatically.");
+                throw new Exception("The 'Region' property was not specified in the configuration, and the agent was unable to discover it automatically.");
             }
+
+            // Check if the configuration contains the ProxyHost property.
+            if (!string.IsNullOrWhiteSpace(context.Configuration[ConfigConstants.PROXY_HOST]))
+            {
+                // Configure the client to use a proxy.
+                clientConfig.ProxyHost = context.Configuration[ConfigConstants.PROXY_HOST];
+
+                // If the customer supplied a port number, use that, otherwise use a default of 80.
+                clientConfig.ProxyPort = ushort.TryParse(context.Configuration[ConfigConstants.PROXY_PORT], out ushort proxyPort) ? proxyPort : 80;
+
+                context.Logger?.LogDebug("Using proxy host '{0}' with port '{1}'", clientConfig.ProxyHost, clientConfig.ProxyPort);
+            }
+
+            // If the configuration contains the ServiceURL property, configure the client to use
+            // the supplied service endpoint (this is used for VPC endpoints).
+            if (!string.IsNullOrWhiteSpace(context.Configuration[ConfigConstants.SERVICE_URL]))
+            {
+                // When using alternate service URL's, the AuthenticationRegion property must be set.
+                // We'll use the existing region's value for this.
+                clientConfig.AuthenticationRegion = clientConfig.RegionEndpoint.SystemName;
+
+                // Try to parse the value into a Uri object. If it doesn't parse correctly, throw an Exception.
+                var urlString = context.Configuration[ConfigConstants.SERVICE_URL];
+                if (!Uri.TryCreate(urlString, UriKind.Absolute, out Uri uri))
+                {
+                    var error = string.Format("The 'ServiceURL' property value '{0}' is not in the correct format for a URL.", urlString);
+                    context.Logger?.LogError(error);
+                    throw new Exception(error);
+                }
+
+                clientConfig.ServiceURL = urlString;
+                context.Logger?.LogDebug("Using alternate service endpoint '{0}' with AuthenticationRegion '{1}'", clientConfig.ServiceURL, clientConfig.AuthenticationRegion);
+            }
+
+            return clientConfig;
+        }
+
+        private static void ConfigureSTSRegionalEndpoint(IConfiguration config)
+        {
+            // Don't set unless the user has specified in the config that they want to use the regional endpoint.
+            if (!bool.TryParse(config[ConfigConstants.USE_STS_REGIONAL_ENDPOINTS], out bool useRegionalSTSEndpoint)) return;
+            if (!useRegionalSTSEndpoint) return;
+
+            // Don't overwrite an existing value if it has already been set.
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(ConfigConstants.STS_REGIONAL_ENDPOINTS_ENV_VARIABLE))) return;
+
+            // Don't set if we can't automatically resolve the region (required for using regional endpoints).
+            var autoDiscoveredRegion = FallbackRegionFactory.GetRegionEndpoint();
+            if (autoDiscoveredRegion == null || autoDiscoveredRegion.DisplayName == "Unknown") return;
+
+            // Set the AWS_STS_REGIONAL_ENDPOINTS environment variable to Regional.
+            // This will mean that customers don't have to set the system-level variable.
+            Environment.SetEnvironmentVariable(ConfigConstants.STS_REGIONAL_ENDPOINTS_ENV_VARIABLE, StsRegionalEndpointsValue.Regional.ToString());
+        }
+
+        private static void SetCommonRequestHeaders(WebServiceRequestEventArgs wsArgs)
+        {
+            wsArgs.Headers[AWSSDKUtils.UserAgentHeader] = UserAgent;
+
+            // Keep connections alive rather than establishing a new TLS session each time
+            // wsArgs.Headers["Connection"] = "KeepAlive";
         }
     }
 }

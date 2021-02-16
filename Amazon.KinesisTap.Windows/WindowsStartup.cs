@@ -12,12 +12,6 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-
 using Amazon.KinesisTap.Core;
 
 namespace Amazon.KinesisTap.Windows
@@ -30,7 +24,6 @@ namespace Amazon.KinesisTap.Windows
         public static void Start()
         {
             Utility.ResolveEnvironmentVariable = WindowsUtility.ResolveEnvironmentVariable;
-            NetworkStatus.CurrentNetwork = new WindowsNetworkStatus();
         }
     }
 }

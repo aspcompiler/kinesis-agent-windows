@@ -24,7 +24,7 @@ namespace Amazon.KinesisTap.Core
 
         public IFactory<T> GetFactory(string entry)
         {
-            if (_catalog.TryGetValue(entry, out var factory))
+            if (!string.IsNullOrWhiteSpace(entry) && _catalog.TryGetValue(entry, out var factory))
             {
                 return factory;
             }

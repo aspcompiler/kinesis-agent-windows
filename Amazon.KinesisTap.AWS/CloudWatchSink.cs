@@ -12,30 +12,28 @@
  * express or implied. See the License for the specific language governing
  * permissions and limitations under the License.
  */
-using Amazon.KinesisTap.Core.Metrics;
 using System;
 using System.Collections.Generic;
-using System.Text;
-using Amazon.KinesisTap.Core;
+using System.Linq;
+using System.Reflection;
+using System.Threading.Tasks;
 using Amazon.CloudWatch;
 using Amazon.CloudWatch.Model;
+using Amazon.Runtime.Internal;
 using Amazon.Util;
 using Microsoft.Extensions.Logging;
-using System.Threading.Tasks;
-using System.Linq;
-using System.Threading;
-using System.Diagnostics;
-using System.Text.RegularExpressions;
-using System.Reflection;
+using Amazon.KinesisTap.Core;
+using Amazon.KinesisTap.Core.Metrics;
 
 namespace Amazon.KinesisTap.AWS
 {
-    public class CloudWatchSink : AWSMetricsSink<PutMetricDataRequest, PutMetricDataResponse, MetricValue>
+    public class CloudWatchSink : AWSMetricsSink<PutMetricDataRequest, PutMetricDataResponse, MetricValue>, IEventSink<List<MetricDatum>>
     {
-        private IAmazonCloudWatch _cloudWatchClient;
-        private string _namespace;
+        private readonly IAmazonCloudWatch _cloudWatchClient;
+        private readonly string _namespace;
         private readonly Dimension[] _dimensions;
-        private int _storageResolution;
+        private readonly int _storageResolution;
+        private readonly DefaultRetryPolicy _defaultRetryPolicy;
 
         private static Dimension[] _defaultDimensions;
         private static Dimension[] DefaultDimensions
@@ -66,6 +64,7 @@ namespace Amazon.KinesisTap.AWS
         public CloudWatchSink(int defaultInterval, IPlugInContext context, IAmazonCloudWatch cloudWatchClient) : base(defaultInterval, context)
         {
             _cloudWatchClient = cloudWatchClient;
+            _defaultRetryPolicy = new DefaultRetryPolicy(_cloudWatchClient.Config);
 
             //StorageResolution is used to specify standard or high-resolution metrics. Valid values are 1 and 60
             //It is different to interval.
@@ -82,7 +81,7 @@ namespace Amazon.KinesisTap.AWS
             {
                 List<Dimension> dimensions = new List<Dimension>();
                 string[] dimensionPairs = dimensionsConfig.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
-                foreach(var dimensionPair in dimensionPairs)
+                foreach (var dimensionPair in dimensionPairs)
                 {
                     string[] keyValue = dimensionPair.Split('=');
                     string value = ResolveVariables(keyValue[1]);
@@ -134,6 +133,23 @@ namespace Amazon.KinesisTap.AWS
                 { MetricsConstants.CLOUDWATCH_PREFIX + MetricsConstants.RECOVERABLE_SERVICE_ERRORS, MetricValue.ZeroCount },
                 { MetricsConstants.CLOUDWATCH_PREFIX + MetricsConstants.SERVICE_SUCCESS, MetricValue.ZeroCount }
             });
+        }
+
+        public void OnNext(IEnvelope<List<MetricDatum>> datums)
+        {
+            List<MetricDatum> records = new List<MetricDatum>();
+            foreach (MetricDatum datum in datums.Data)
+            {
+                // Append the default dimensions if datum doesn't have dimensions
+                if (datum.Dimensions == null || datum.Dimensions.Count == 0)
+                {
+                    datum.Dimensions = _dimensions.ToList();
+                }
+                records.Add(datum);
+            }
+
+            // Send Metric datums request
+            PutMetricDataAsync(records).Wait();
         }
         #endregion
 
@@ -193,9 +209,7 @@ namespace Amazon.KinesisTap.AWS
 
         protected override bool IsRecoverable(Exception ex)
         {
-            return !(ex is InvalidParameterCombinationException
-                    || ex is InvalidParameterValueException
-                    || ex is MissingRequiredParameterException);
+            return _defaultRetryPolicy.RetryForException(null, ex);
         }
         #endregion
 
@@ -208,11 +222,11 @@ namespace Amazon.KinesisTap.AWS
             PrepareMetricDatums(filteredLastValues, datums);
             if (_aggregatedMetricsFilters.Count > 0)
             {
-                var filteredAggregatedAccumulatedValues = 
-                    FilterAndAggregateValues(accumlatedValues, 
+                var filteredAggregatedAccumulatedValues =
+                    FilterAndAggregateValues(accumlatedValues,
                         values => new MetricValue(values.Sum(v => v.Value), values.First().Unit));
                 PrepareMetricDatums(filteredAggregatedAccumulatedValues, datums);
-                var filteredAggregatedLastValues = FilterAndAggregateValues(lastValues, 
+                var filteredAggregatedLastValues = FilterAndAggregateValues(lastValues,
                     values => new MetricValue((long)values.Average(v => v.Value), values.First().Unit));
                 PrepareMetricDatums(filteredAggregatedLastValues, datums);
             }
@@ -239,13 +253,23 @@ namespace Amazon.KinesisTap.AWS
 
         private async Task PutMetricDataAsync(List<MetricDatum> datums)
         {
+            _logger?.LogDebug($"CloudWatchSink {this.Id} sending a total of {datums.Count} datums.");
             //cloudwatch can only handle 20 datums at a time
             foreach (var subDatums in datums.Chunk(20))
             {
+                var metricsToSend = subDatums as List<MetricDatum>;
+                if (metricsToSend == null)
+                {
+                    _logger?.LogError($"CloudWatchSink {this.Id} trying to send a chunk with null datums");
+                }
+                else
+                {
+                    _logger?.LogDebug($"CloudWatchSink {this.Id} trying to send a chunk with {metricsToSend.Count} datums.");
+                }
                 var putMetricDataRequest = new PutMetricDataRequest()
                 {
                     Namespace = _namespace,
-                    MetricData = subDatums as List<MetricDatum>
+                    MetricData = metricsToSend
                 };
                 await PutMetricDataAsync(putMetricDataRequest);
             }
@@ -260,7 +284,7 @@ namespace Amazon.KinesisTap.AWS
                     Dimensions = GetDimensions(metric.Key.Id, metric.Key.Category),
                     Value = metric.Value.Value,
                     MetricName = metric.Key.Name,
-                    Timestamp = DateTime.UtcNow,
+                    TimestampUtc = DateTime.UtcNow,
                     StorageResolution = _storageResolution,
                     Unit = _unitMap[metric.Value.Unit]
                 });

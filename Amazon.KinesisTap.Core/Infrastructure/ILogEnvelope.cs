@@ -22,7 +22,6 @@ namespace Amazon.KinesisTap.Core
     {
         string FilePath { get; }
         string FileName { get; }
-        long Position { get; }
         long LineNumber { get; }
     }
 }

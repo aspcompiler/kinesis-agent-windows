@@ -13,26 +13,24 @@
  * permissions and limitations under the License.
  */
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Text;
 using System.IO;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.DependencyInjection;
 using System.Linq;
 using System.Reactive.Linq;
-using System.Threading;
 using System.Reactive.Subjects;
-using Newtonsoft.Json;
-using System.Collections.Concurrent;
-using Amazon.KinesisTap.Core.Metrics;
+using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using Amazon.KinesisTap.Core.Metrics;
+using Microsoft.Extensions.Logging;
 
 namespace Amazon.KinesisTap.Core
 {
     /// <summary>
     /// Watch a direction for log files
     /// </summary>
-    public class DirectorySource<TData, TContext> : DependentEventSource<TData>, IBookmarkable where TContext : LogContext
+    public class DirectorySource<TData, TContext> : DependentEventSource<TData>, IBookmarkable where TContext : LogContext, new()
     {
         //Exclude well-known compressed files when using wild-card filter *.*
         private static readonly string[] _excludedExtensions = new string[] { ".zip", ".gz", ".bz2" };
@@ -49,12 +47,17 @@ namespace Amazon.KinesisTap.Core
         private ISubject<IEnvelope<TData>> _recordSubject = new Subject<IEnvelope<TData>>();
         private bool _hasBookmark;
         private readonly object _bookmarkFileLock = new object();
+        private readonly bool includeSubdirectories;
+        private readonly string[] includeDirectoryFilter;
+
+        private readonly string bookmarkDir;
+        private readonly bool bookmarkOnBufferFlush = false;
+        private string bookmarkPath;
 
         protected bool _started;
-        protected IRecordParser<TData, TContext> _recordParser;
-        protected ISet<string> _buffer = new HashSet<string>();
-        protected IDictionary<string, TContext> _logFiles = new ConcurrentDictionary<string, TContext>();
-        protected Func<string, long, TContext> _logSourceInfoFactory;
+        protected readonly IRecordParser<TData, TContext> _recordParser;
+        protected readonly ISet<string> _buffer = new HashSet<string>();
+        internal readonly IDictionary<string, TContext> _logFiles = new ConcurrentDictionary<string, TContext>();
 
         /// <summary>
         /// Constructor
@@ -63,12 +66,11 @@ namespace Amazon.KinesisTap.Core
         /// <param name="filterSpec">File name filter</param>
         /// <param name="logger">Logger</param>
         public DirectorySource(
-            string directory, 
-            string filterSpec, 
+            string directory,
+            string filterSpec,
             int interval,
-            IPlugInContext context, 
-            IRecordParser<TData, TContext> recordParser,
-            Func<string, long, TContext> logSourceInfoFactory
+            IPlugInContext context,
+            IRecordParser<TData, TContext> recordParser
         ) : base(new DirectoryDependency(directory), context)
         {
             Guard.ArgumentNotNullOrEmpty(directory, nameof(directory));
@@ -82,56 +84,32 @@ namespace Amazon.KinesisTap.Core
             }
             _interval = interval;
             _recordParser = recordParser;
-            _logSourceInfoFactory = logSourceInfoFactory;
             if (_config != null)
             {
                 _skipLines = Utility.ParseInteger(_config["SkipLines"], 0);
                 _encoding = _config["Encoding"];
+                bool.TryParse(this._config["IncludeSubdirectories"], out bool result);
+                this.includeSubdirectories = result ? bool.Parse(this._config["IncludeSubdirectories"]) : false;
+                if (this.includeSubdirectories)
+                {
+                    this.includeDirectoryFilter = _config["IncludeDirectoryFilter"]?.Split(';');
+                }
+                if (bool.TryParse(_config["BookmarkOnBufferFlush"] ?? "false", out bool bookmarkOnBufferFlush))
+                    this.bookmarkOnBufferFlush = bookmarkOnBufferFlush;
             }
+
+            this.bookmarkDir = Path.GetDirectoryName(GetBookmarkFilePath());
+            if (!Directory.Exists(this.bookmarkDir))
+                Directory.CreateDirectory(this.bookmarkDir);
 
             _timer = new Timer(OnTimer, null, Timeout.Infinite, Timeout.Infinite);
             DelayBetweenDependencyPoll = TimeSpan.FromSeconds(5);
         }
 
-        /// <summary>
-        /// Parse filter specification and return a list of filters
-        /// </summary>
-        /// <param name="filterSpec">Filter Specification to parse.</param>
-        /// <returns>An array of filters. Should contain at least 1 or it will throw exception.</returns>
-        private string[] ParseFilterSpec(string filterSpec)
-        {
-            string[] filters;
-            if (string.IsNullOrWhiteSpace(filterSpec))
-            {
-                filters = new string[] { "*.*" };
-            }
-            else
-            {
-                string[] tempfilters = filterSpec.Split(new char[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
-                List<string> acceptedFilters = new List<string>();
-                foreach(var filter in tempfilters)
-                {
-                    if (ShouldExclude(filter))
-                    {
-                        _logger?.LogWarning($"Extension {Path.GetExtension(filter)} is not supported.");
-                    }
-                    else
-                    {
-                        acceptedFilters.Add(filter);
-                    }
-                }
-                if (acceptedFilters.Count == 0)
-                {
-                    throw new ArgumentException("No acceptable filters.");
-                }
-                filters = acceptedFilters.ToArray();
-            }
-            return filters;
-        }
-
         #region public methods
         public override void Start()
         {
+            this.bookmarkPath = GetBookmarkFilePath();
             if (_dependency.IsDependencyAvailable())
             {
                 if (_watcher == null)
@@ -145,7 +123,7 @@ namespace Amazon.KinesisTap.Core
                 return;
             }
 
-            if (this.InitialPosition != InitialPositionEnum.EOS && File.Exists(GetBookmarkFilePath()))
+            if (this.InitialPosition != InitialPositionEnum.EOS && File.Exists(this.bookmarkPath))
             {
                 _hasBookmark = true;
                 try
@@ -182,16 +160,16 @@ namespace Amazon.KinesisTap.Core
             Start();
         }
 
-
         public override void Stop()
         {
             if (_watcher != null)
-            {
                 _watcher.EnableRaisingEvents = false;
-            }
             _timer.Change(Timeout.Infinite, Timeout.Infinite);
-            _started = false;
+
             SaveBookmark();
+            _started = false;
+            if (this.bookmarkOnBufferFlush)
+                _logFiles.Clear();
 
             _logger?.LogInformation($"DirectorySource id {this.Id} watching directory {_directory} with filter {_filterSpec} stopped.");
         }
@@ -220,7 +198,7 @@ namespace Amazon.KinesisTap.Core
             {
                 try
                 {
-                    using (var fs = new FileStream(GetBookmarkFilePath(), FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var fs = new FileStream(this.bookmarkPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     using (var sr = new StreamReader(fs))
                     {
                         while (!sr.EndOfStream)
@@ -231,9 +209,12 @@ namespace Amazon.KinesisTap.Core
                                 try
                                 {
                                     string[] parts = line.Split(',');
-                                    _logFiles[Path.GetFileName(parts[0])] = _logSourceInfoFactory(parts[0], long.Parse(parts[1]));
+                                    var logSource = CreateLogSourceInfo(parts[0], long.Parse(parts[1]));
+                                    _logFiles[GetRelativeFilePath(parts[0], _directory)] = logSource;
+                                    if (this.bookmarkOnBufferFlush)
+                                        BookmarkManager.RegisterBookmark(this.GetBookmarkName(logSource.FilePath), logSource.Position, (id) => this.SaveBookmark());
                                 }
-                                catch(Exception ex)
+                                catch (Exception ex)
                                 {
                                     //Allow continue processing because it is legitimate for system to remove log files while the agent is stopped
                                     _logger?.LogWarning($"Fail to process bookmark {line}: {ex.ToMinimized()}");
@@ -242,7 +223,7 @@ namespace Amazon.KinesisTap.Core
                         }
                     }
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
                     _logger?.LogError($"Failed loading bookmark: {ex.ToMinimized()}");
                     throw; //Inform caller the error
@@ -252,6 +233,8 @@ namespace Amazon.KinesisTap.Core
 
         public void SaveBookmark()
         {
+            if (this.InitialPosition == InitialPositionEnum.EOS || !this._started) return;
+
             // We don't gather the contents of the bookmark file outside of the lock because
             // we want to avoid a situation where two threads capture position info at slightly different times, and then they write the file out of sequence 
             // (older collected data after newer collected data) since that would lead to out of date bookmarks recorded in the bookmark file.  In other words
@@ -260,24 +243,22 @@ namespace Amazon.KinesisTap.Core
             {
                 try
                 {
-                    string bookmarkDir = Path.GetDirectoryName(GetBookmarkFilePath());
-                    if (!Directory.Exists(bookmarkDir))
+                    using (var fs = new FileStream(this.bookmarkPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    using (var sw = new StreamWriter(fs))
                     {
-                        Directory.CreateDirectory(bookmarkDir);
-                    }
-                    if (InitialPosition != InitialPositionEnum.EOS)
-                    {
-                        using (var fs = File.OpenWrite(GetBookmarkFilePath()))
-                        using (var sw = new StreamWriter(fs))
+                        foreach (var logFile in _logFiles.Values)
                         {
-                            foreach (var logFile in _logFiles.Values)
-                            {
-                                sw.WriteLine($"{logFile.FilePath},{logFile.Position}");
-                            }
+                            long position;
+                            if (this.bookmarkOnBufferFlush)
+                                position = BookmarkManager.GetBookmark(this.GetBookmarkName(logFile.FilePath))?.Position ?? logFile.Position;
+                            else
+                                position = logFile.Position;
+
+                            sw.WriteLine($"{logFile.FilePath},{position}");
                         }
                     }
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
                     _logger?.LogError($"Failed saving bookmark: {ex.ToMinimized()}");
                 }
@@ -295,32 +276,41 @@ namespace Amazon.KinesisTap.Core
         {
             try
             {
-                string fileName = e.Name;
+                if (this.includeSubdirectories && this.ShouldSkip(e.FullPath))
+                    return;
+
+                string relativeFilePath = e.Name;
 
                 //Sometimes we receive event where e.name is null so we should just skip it
-                if (string.IsNullOrEmpty(fileName) || ShouldExclude(fileName) || !ShouldInclude(fileName)) return;
+                if (string.IsNullOrEmpty(relativeFilePath) || ShouldExclude(relativeFilePath) || !ShouldInclude(relativeFilePath)) return;
 
                 //The entries in _buffer should be deleted before _logfiles and added after _logfiles
                 switch (e.ChangeType)
                 {
                     case WatcherChangeTypes.Deleted:
-                        RemoveFromBuffer(fileName);
-                        _logFiles.Remove(fileName);
+                        if (!File.Exists(e.FullPath)) //macOS sometimes fires this event when a file is created so we need this extra check.
+                        {
+                            RemoveFromBuffer(relativeFilePath);
+                            _logFiles.Remove(relativeFilePath);
+                            BookmarkManager.RemoveBookmark(this.GetBookmarkName(e.FullPath));
+                        }
                         break;
                     case WatcherChangeTypes.Created:
-                        if (!_logFiles.ContainsKey(fileName))
+                        if (!_logFiles.ContainsKey(relativeFilePath))
                         {
-                            _logFiles[fileName] = _logSourceInfoFactory(e.FullPath, 0);
-                            AddToBuffer(fileName);
+                            _logFiles[relativeFilePath] = CreateLogSourceInfo(e.FullPath, 0);
+                            if (this.bookmarkOnBufferFlush)
+                                BookmarkManager.RegisterBookmark(this.GetBookmarkName(e.FullPath), 0, (pos) => this.SaveBookmark());
+                            AddToBuffer(relativeFilePath);
                         }
                         break;
                     case WatcherChangeTypes.Changed:
-                        AddToBuffer(fileName);
+                        AddToBuffer(relativeFilePath);
                         break;
                 }
                 _logger?.LogDebug($"ThreadId{Thread.CurrentThread.ManagedThreadId} File: {e.FullPath} ChangeType: {e.ChangeType}");
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 _logger?.LogError(ex.ToMinimized());
             }
@@ -330,6 +320,10 @@ namespace Amazon.KinesisTap.Core
         {
             try
             {
+                // this is for Subdirectories check only
+                if (this.includeSubdirectories && this.ShouldSkip(e.FullPath))
+                    return;
+
                 //Sometimes we receive event where e.name is null so we should just skip it
                 if (string.IsNullOrEmpty(e.Name) || string.IsNullOrEmpty(e.OldName)
                     || ShouldExclude(e.Name) || ShouldExclude(e.OldName)
@@ -342,21 +336,33 @@ namespace Amazon.KinesisTap.Core
                 RemoveFromBuffer(e.OldName);
                 if (_logFiles.ContainsKey(e.OldName))
                 {
-                    var newSourceInfo = _logSourceInfoFactory(e.FullPath, _logFiles[e.OldName].Position);
+                    var newSourceInfo = CreateLogSourceInfo(e.FullPath, _logFiles[e.OldName].Position);
                     newSourceInfo.LineNumber = _logFiles[e.OldName].LineNumber;
                     _logFiles[e.Name] = newSourceInfo;
                     _logFiles.Remove(e.OldName);
+
+                    var bookmark = BookmarkManager.GetBookmark(this.GetBookmarkName(e.OldFullPath));
+                    if (bookmark != null)
+                    {
+                        BookmarkManager.RemoveBookmark(bookmark.Id);
+                        BookmarkManager.RegisterBookmark(this.GetBookmarkName(e.FullPath), bookmark.Position, (id) => this.SaveBookmark());
+                    }
                 }
                 else
                 {
-                    _logFiles.Add(e.Name, _logSourceInfoFactory(e.FullPath, 0));
+                    var newSource = CreateLogSourceInfo(e.FullPath, 0);
+                    _logFiles.Add(e.Name, newSource);
+                    BookmarkManager.RegisterBookmark(this.GetBookmarkName(e.FullPath), 0, (id) => this.SaveBookmark());
                 }
-                AddToBuffer(e.Name);
-                _logger?.LogInformation("File: {0} renamed to {1}", e.OldFullPath, e.FullPath);
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 _logger?.LogError(ex.ToMinimized());
+            }
+            finally
+            {
+                AddToBuffer(e.Name);
+                _logger?.LogInformation("File: {0} renamed to {1}", e.OldFullPath, e.FullPath);
             }
         }
 
@@ -374,12 +380,12 @@ namespace Amazon.KinesisTap.Core
                 long bytesToRead = 0;
                 long filesToProcess = 0;
 
-                foreach (string fileName in _logFiles.Keys)
+                foreach (string relativeFilePath in _logFiles.Keys)
                 {
                     if (!_started) break;
                     try
                     {
-                        TContext fileContext = _logFiles[fileName];
+                        TContext fileContext = _logFiles[relativeFilePath];
                         FileInfo fi = new FileInfo(fileContext.FilePath);
                         long fileLength = fi.Length;
                         if (fileLength == fileContext.Position) //No change
@@ -391,10 +397,11 @@ namespace Amazon.KinesisTap.Core
                             _logger?.LogWarning($"File: {fi.Name} shrunk or truncated from {fileContext.Position} to {fi.Length}");
                             //Other than malicious attack, the most likely scenario is file truncate so we will read from the beginning
                             fileContext.Position = 0;
+                            BookmarkManager.ResetBookmarkPosition(this.GetBookmarkName(fileContext.FilePath), -1);
                         }
                         bytesToRead += fi.Length - fileContext.Position;
                         filesToProcess++;
-                        AddToBuffer(fileName);
+                        AddToBuffer(relativeFilePath);
                     }
                     catch { }
                 }
@@ -408,15 +415,15 @@ namespace Amazon.KinesisTap.Core
                 string[] files = null;
                 lock (_buffer)
                 {
-                     files = new string[_buffer.Count];
+                    files = new string[_buffer.Count];
                     _buffer.CopyTo(files, 0);
                     _buffer.Clear();
                 }
 
                 (long recordsRead, long bytesRead) = ParseLogFiles(files);
-                SaveBookmark();
+                if (!this.bookmarkOnBufferFlush) SaveBookmark();
 
-               _metrics?.PublishCounters(this.Id, MetricsConstants.CATEGORY_SOURCE, Metrics.CounterTypeEnum.Increment, new Dictionary<string, MetricValue>()
+                _metrics?.PublishCounters(this.Id, MetricsConstants.CATEGORY_SOURCE, Metrics.CounterTypeEnum.Increment, new Dictionary<string, MetricValue>()
                 {
                     { MetricsConstants.DIRECTORY_SOURCE_RECORDS_READ, new MetricValue(recordsRead) },
                     { MetricsConstants.DIRECTORY_SOURCE_BYTES_READ, new MetricValue(bytesRead, MetricUnit.Bytes) },
@@ -436,48 +443,55 @@ namespace Amazon.KinesisTap.Core
             }
         }
 
-        protected virtual (long recordsRead, long bytesRead) ParseLogFile(string fileName, string fullPath)
+        protected virtual (long recordsRead, long bytesRead) ParseLogFile(string relativeFilePath, string fullPath)
         {
             long recordsRead = 0;
             long bytesRead = 0;
 
-            if (!_logFiles.TryGetValue(fileName, out TContext sourceInfo))
+            int bookmarkId;
+            if (!_logFiles.TryGetValue(relativeFilePath, out TContext sourceInfo))
             {
-                sourceInfo = _logSourceInfoFactory(fullPath, 0);
-                _logFiles.Add(fileName, sourceInfo);
+                sourceInfo = CreateLogSourceInfo(fullPath, 0);
+                _logFiles.Add(relativeFilePath, sourceInfo);
+                bookmarkId = this.bookmarkOnBufferFlush ? BookmarkManager.RegisterBookmark(this.GetBookmarkName(fullPath), 0, (pos) => this.SaveBookmark()).Id : 0;
             }
+            else
+            {
+                bookmarkId = BookmarkManager.GetBookmarkId(this.GetBookmarkName(fullPath));
+            }
+
             try
             {
                 using (var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = CreateStreamReader(fs, _encoding))
                 {
-                    //The responsibility of the following line has been moved to parser in case the parser need to get the meta data before the position
-                    //fs.Position = sourceInfo.Position; 
-                    using (var sr = CreateStreamReader(fs, _encoding))
+                    var records = _recordParser.ParseRecords(sr, sourceInfo);
+                    foreach (var record in records)
                     {
-                        var records = _recordParser.ParseRecords(sr, sourceInfo);
-                        foreach (var record in records)
+                        ILogEnvelope envelope = (ILogEnvelope)record;
+                        if (envelope != null
+                            && record.Timestamp > (this.InitialPositionTimestamp ?? DateTime.MinValue)
+                            && envelope.LineNumber > _skipLines)
                         {
-                            ILogEnvelope envelope = (ILogEnvelope)record;
-                            if (record.Timestamp > (this.InitialPositionTimestamp ?? DateTime.MinValue)
-                                && envelope.LineNumber > _skipLines)
-                            {
-                                _recordSubject.OnNext(record);
-                                recordsRead++;
-                            }
-                            if (!_started) break;
+                            record.BookmarkId = bookmarkId;
+                            _recordSubject.OnNext(record);
+                            recordsRead++;
                         }
 
                         //Need to grab the position before disposing the reader because disposing the reader will dispose the stream
                         bytesRead = fs.Position - sourceInfo.Position;
                         sourceInfo.Position = fs.Position;
-                        sourceInfo.ConsecutiveIOExceptionCount = 0;
+
+                        if (!_started) break;
                     }
+
+                    sourceInfo.ConsecutiveIOExceptionCount = 0;
                 }
             }
-            catch(IOException ex)
+            catch (IOException ex)
             {
                 //Add it back to buffer for processing
-                AddToBuffer(fileName);
+                AddToBuffer(relativeFilePath);
                 sourceInfo.ConsecutiveIOExceptionCount++;
                 if (sourceInfo.ConsecutiveIOExceptionCount >= this.NumberOfConsecutiveIOExceptionsToLogError)
                 {
@@ -524,18 +538,61 @@ namespace Amazon.KinesisTap.Core
         }
 
         /// <summary>
+        /// Determine whether should skip watching this file
+        /// </summary>
+        /// <param name="fullPath">fullPath</param>
+        /// <returns>Whether the file should be skipped</returns>
+        private bool ShouldSkip(string fullPath)
+        {
+            // When a file is changed, it sends multiple change events for both the file and the directory. 
+            // We only need to process the event for the file. 
+            // That's why we skip the event for for the directory.
+            if (File.GetAttributes(fullPath).HasFlag(FileAttributes.Directory))
+                return true;
+
+            return this.ShouldSkipSubDirectory(Path.GetDirectoryName(fullPath));
+        }
+
+        /// <summary>
+        /// Determine whether should skip the directory based on includeDirectoryFilter
+        /// </summary>
+        /// <param name="subdirectory">subdirectory</param>
+        /// <returns>Whether the subdirectory should be skipped</returns>
+        private bool ShouldSkipSubDirectory(string subdirectory)
+        {
+            try
+            {
+                if (this.includeDirectoryFilter == null)
+                    return false;
+
+                if (subdirectory.Equals(_directory)) return false; // if it's the top level directory, we will always process files directly under it.
+                var relativeDirectory = GetRelativeFilePath(subdirectory, _directory);
+                if (this.includeDirectoryFilter.Any(i => i.Equals(relativeDirectory)))
+                    return false;  // if the includeDirectory is set and the relativeDirectory is specified in includeDirectoryFilter, we will process it.
+                else
+                    return true;  // if the includeDirectory is set and the relativeDirectory is not specified in includeDirectoryFilter, we will skip it.
+            }
+            catch (Exception e)
+            {
+                this._logger.LogWarning($"Error occurred while checking if log source directory should get excluded: '{e}'");
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Determine whether should include the file when there are multiple file filters.
         /// If there is only one file filter, the filter is handled by FileSystemWatcher
         /// If there are multiple file filters, such as "*.log|*.txt", this function will determine whether the file should be included
         /// </summary>
-        /// <param name="fileName">File Name</param>
+        /// <param name="relativeFilePath">Relative Path</param>
         /// <returns>Whether the file should be included</returns>
-        private bool ShouldInclude(string fileName)
+        private bool ShouldInclude(string relativeFilePath)
         {
             if (_fileFilters.Length <= 1) return true;
-            foreach(var regex in _fileFilterRegexs)
+            foreach (var regex in _fileFilterRegexs)
             {
-                if (regex.IsMatch(fileName)) return true;
+                if (regex.IsMatch(relativeFilePath)) return true;
             }
             return false;
         }
@@ -546,6 +603,7 @@ namespace Amazon.KinesisTap.Core
             _watcher = new FileSystemWatcher
             {
                 Path = _directory,
+                IncludeSubdirectories = this.includeSubdirectories,
                 Filter = _fileFilters.Length == 1 ? _fileFilters[0] : "*.*",
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size
             };
@@ -559,16 +617,16 @@ namespace Amazon.KinesisTap.Core
         private (long recordsRead, long bytesRead) ParseLogFiles(string[] files)
         {
             var toProcess = files
-                .Select(fn => (fileName: fn, fullPath: Path.Combine(_directory, fn)))
+                .Select(fn => (relativeFilePath: fn, fullPath: Path.Combine(_directory, fn)))
                 .Where(_ => File.Exists(_.fullPath))
                 .OrderBy(_ => new FileInfo(_.fullPath).LastWriteTime);
 
             long totalRecordsRead = 0;
             long totalBytesRead = 0;
-            foreach (var (fileName, fullPath) in toProcess)
+            foreach (var (relativeFilePath, fullPath) in toProcess)
             {
                 if (!_started) break;
-                (long recordsRead, long bytesRead) = ParseLogFile(fileName, fullPath);
+                (long recordsRead, long bytesRead) = ParseLogFile(relativeFilePath, fullPath);
                 totalRecordsRead += recordsRead;
                 totalBytesRead += bytesRead;
             }
@@ -577,66 +635,58 @@ namespace Amazon.KinesisTap.Core
 
         private void ReadBookmarkFromLogFiles()
         {
-            var candidateFiles = _fileFilters.SelectMany(filter => Directory.GetFiles(_directory, filter))
+            var candidateFiles = _fileFilters.SelectMany(filter => this.GetFiles(_directory, filter))
                 .Where(file => !ShouldExclude(file));
 
             if (_fileFilters.Length > 1)
             {
                 //If there are multiple filters, they may overlap so we need to dedupe
-                candidateFiles = candidateFiles.Distinct(); 
+                candidateFiles = candidateFiles.Distinct();
             }
             string[] files = candidateFiles.ToArray();
 
             foreach (string filePath in files)
             {
                 FileInfo fi = new FileInfo(filePath);
-                string fileName = Path.GetFileName(filePath);
+                var relativeFilePath = GetRelativeFilePath(filePath, _directory);
                 long fileSize = fi.Length;
-                switch(this.InitialPosition)
+
+                if (_hasBookmark && this.InitialPosition != InitialPositionEnum.EOS)
+                {
+                    ProcessNewOrExpandedFiles(filePath, relativeFilePath, fileSize);
+                    continue;
+                }
+
+                switch (this.InitialPosition)
                 {
                     case InitialPositionEnum.EOS:
-                        _logFiles[fileName] = _logSourceInfoFactory(filePath, fi.Length);
+                        _logFiles[relativeFilePath] = CreateLogSourceInfo(filePath, fi.Length);
                         break;
                     case InitialPositionEnum.BOS:
-                        if (_hasBookmark)
-                        {
-                            ProcessNewOrExpandedFiles(filePath, fileName, fileSize);
-                        }
-                        else
-                        {
-                            //Process all files
-                            _logFiles.Add(fileName, _logSourceInfoFactory(filePath, 0));
-                            AddToBuffer(fileName);
-                        }
+                        //Process all files
+                        _logFiles[relativeFilePath] = CreateLogSourceInfo(filePath, 0);
+                        if (this.bookmarkOnBufferFlush)
+                            BookmarkManager.RegisterBookmark(this.GetBookmarkName(filePath), 0, (pos) => this.SaveBookmark());
+                        AddToBuffer(relativeFilePath);
                         break;
                     case InitialPositionEnum.Bookmark:
-                        if (_hasBookmark)
-                        {
-                            ProcessNewOrExpandedFiles(filePath, fileName, fileSize);
-                        }
-                        else
-                        {
-                            _logFiles[fileName] = _logSourceInfoFactory(filePath, fi.Length);
-                        }
+                        _logFiles[relativeFilePath] = CreateLogSourceInfo(filePath, fi.Length);
+                        if (this.bookmarkOnBufferFlush)
+                            BookmarkManager.RegisterBookmark(this.GetBookmarkName(filePath), fi.Length, (pos) => this.SaveBookmark());
                         break;
                     case InitialPositionEnum.Timestamp:
-                        if (_hasBookmark)
+                        if (fi.LastWriteTimeUtc > this.InitialPositionTimestamp)
                         {
-                            ProcessNewOrExpandedFiles(filePath, fileName, fileSize);
+                            _logFiles[relativeFilePath] = CreateLogSourceInfo(filePath, 0);
+                            if (this.bookmarkOnBufferFlush)
+                                BookmarkManager.RegisterBookmark(this.GetBookmarkName(filePath), 0, (pos) => this.SaveBookmark());
+                            AddToBuffer(relativeFilePath);
                         }
                         else
                         {
-                            DateTime fileDateTime = File.GetLastWriteTimeUtc(filePath);
-                            if (fileDateTime > this.InitialPositionTimestamp)
-                            {
-                                _logFiles.Add(fileName, _logSourceInfoFactory(filePath, 0));
-                                AddToBuffer(fileName);
-
-                            }
-                            else
-                            {
-                                _logFiles[fileName] = _logSourceInfoFactory(filePath, fi.Length);
-                            }
+                            _logFiles[relativeFilePath] = CreateLogSourceInfo(filePath, fi.Length);
+                            if (this.bookmarkOnBufferFlush)
+                                BookmarkManager.RegisterBookmark(this.GetBookmarkName(filePath), fi.Length, (pos) => this.SaveBookmark());
                         }
                         break;
                     default:
@@ -645,38 +695,64 @@ namespace Amazon.KinesisTap.Core
             }
         }
 
-        private void ProcessNewOrExpandedFiles(string filePath, string fileName, long fileSize)
+        private string[] GetFiles(string directory, string filter)
+        {
+            var list = new List<string>();
+            this.GetFilesHelper(list, directory, filter);
+            return list.ToArray();
+        }
+
+        private void GetFilesHelper(List<string> list, string directory, string filter)
+        {
+            if (!this.includeSubdirectories || !this.ShouldSkipSubDirectory(directory))
+                list.AddRange(Directory.GetFiles(directory, filter));
+
+            foreach (var subdir in Directory.GetDirectories(directory))
+            {
+                GetFilesHelper(list, subdir, filter);
+            }
+        }
+
+        private void ProcessNewOrExpandedFiles(string filePath, string relativeFilePath, long fileSize)
         {
             //Only process new or expanded files
-            if (_logFiles.TryGetValue(fileName, out TContext context))
+            if (_logFiles.TryGetValue(relativeFilePath, out TContext context))
             {
-                if (fileSize > context.Position)
+                // If there is no registered bookmark and we're bookmarking on buffer flush,
+                // that means the file was read and events buffered, but never uploaded by the source.
+                var position = this.bookmarkOnBufferFlush
+                    ? (BookmarkManager.GetBookmark(this.GetBookmarkName(filePath)) ?? BookmarkManager.RegisterBookmark(this.GetBookmarkName(filePath), 0, (pos) => this.SaveBookmark())).Position
+                    : context.Position;
+
+                if (fileSize > position)
                 {
-                    //Expanded file
-                    AddToBuffer(fileName);
+                    // The file is expanded compared with position saved in bookmark
+                    AddToBuffer(relativeFilePath);
                 }
             }
             else
             {
                 //New file
-                _logFiles.Add(fileName, _logSourceInfoFactory(filePath, 0));
-                AddToBuffer(fileName);
+                _logFiles.Add(relativeFilePath, CreateLogSourceInfo(filePath, 0));
+                if (this.bookmarkOnBufferFlush)
+                    BookmarkManager.RegisterBookmark(this.GetBookmarkName(filePath), 0, (pos) => this.SaveBookmark());
+                AddToBuffer(relativeFilePath);
             }
         }
 
-        private void AddToBuffer(string fileName)
+        private void AddToBuffer(string relativeFilePath)
         {
             lock (_buffer)
             {
-                _buffer.Add(fileName);
+                _buffer.Add(relativeFilePath);
             }
         }
 
-        private void RemoveFromBuffer(string fileName)
+        private void RemoveFromBuffer(string relativeFilePath)
         {
             lock (_buffer)
             {
-                _buffer.Remove(fileName);
+                _buffer.Remove(relativeFilePath);
             }
         }
 
@@ -690,6 +766,110 @@ namespace Amazon.KinesisTap.Core
             {
                 return new StreamReader(stream, Encoding.GetEncoding(encoding));
             }
+        }
+
+        private TContext CreateLogSourceInfo(string filePath, long position)
+        {
+            var context = new TContext { FilePath = filePath, Position = position };
+            if (position > 0)
+            {
+                for (int attempt = 1; attempt <= 10; attempt++)
+                {
+                    try
+                    {
+                        context.LineNumber = GetLineCount(filePath, position);
+                        break;
+                    }
+                    catch (IOException ex)
+                    {
+                        // Rethrow immediately if max attempts has been reached
+                        if (attempt == 10) throw;
+
+                        // Check if the error was caused by a file lock. If so, attempt retry.
+                        if (ex.Message.Contains("it is being used by another process"))
+                        {
+                            _logger?.LogWarning("{0} (attempt {1})", ex.Message, attempt);
+                            Thread.Sleep(TimeSpan.FromSeconds(attempt));
+                            continue;
+                        }
+
+                        // If the error wasn't relating to a file lock, rethrow.
+                        throw;
+                    }
+                }
+            }
+            return context;
+        }
+
+        /// <summary>
+        /// Get Unique Name for Bookmark
+        /// </summary>
+        /// <param name="filePath">filePath</param>
+        /// <returns>Unique Name for Bookmark</returns>
+        private string GetBookmarkName(string filePath)
+        {
+            return this.Id + "+" + filePath;
+        }
+
+        private static long GetLineCount(string filePath, long position)
+        {
+            long lineCount = 0;
+            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = new StreamReader(fs))
+            {
+                while (!sr.EndOfStream && sr.BaseStream.Position < position)
+                {
+                    sr.ReadLine();
+                    lineCount++;
+                }
+            }
+            return lineCount;
+        }
+
+        private static string GetRelativeFilePath(string filePath, string directory)
+        {
+            // Directories must end in a slash
+            if (!directory.EndsWith(Path.DirectorySeparatorChar.ToString()))
+            {
+                directory += Path.DirectorySeparatorChar;
+            }
+            return filePath.StartsWith(directory) ? filePath.Substring(directory.Length) : filePath;
+        }
+
+        /// <summary>
+        /// Parse filter specification and return a list of filters
+        /// </summary>
+        /// <param name="filterSpec">Filter Specification to parse.</param>
+        /// <returns>An array of filters. Should contain at least 1 or it will throw exception.</returns>
+        private string[] ParseFilterSpec(string filterSpec)
+        {
+            string[] filters;
+            if (string.IsNullOrWhiteSpace(filterSpec))
+            {
+                filters = new string[] { "*.*" };
+            }
+            else
+            {
+                string[] tempfilters = filterSpec.Split(new char[] { '|' }, StringSplitOptions.RemoveEmptyEntries);
+                List<string> acceptedFilters = new List<string>();
+                foreach (var filter in tempfilters)
+                {
+                    if (ShouldExclude(filter))
+                    {
+                        _logger?.LogWarning($"Extension {Path.GetExtension(filter)} is not supported.");
+                    }
+                    else
+                    {
+                        acceptedFilters.Add(filter);
+                    }
+                }
+                if (acceptedFilters.Count == 0)
+                {
+                    throw new ArgumentException("No acceptable filters.");
+                }
+                filters = acceptedFilters.ToArray();
+            }
+            return filters;
         }
         #endregion
     }

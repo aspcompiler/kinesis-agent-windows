@@ -32,7 +32,8 @@ namespace Amazon.KinesisTap.Core
         protected readonly IConfiguration _config;
         protected readonly ILogger _logger;
         protected readonly IMetrics _metrics;
-        protected readonly bool _required; 
+        protected readonly bool _required;
+        protected DateTime? _initialPositionTimestamp;
 
         /// <summary>
         /// EventSource constructor that takes a context
@@ -55,6 +56,8 @@ namespace Amazon.KinesisTap.Core
             }
         }
 
+        protected BookmarkManager BookmarkManager => _context.BookmarkManager;
+
         /// <summary>
         /// Gets or Sets the Id of the EventSource
         /// </summary>
@@ -67,8 +70,34 @@ namespace Amazon.KinesisTap.Core
 
         /// <summary>
         /// Gets or sets optional InitialPositionTimestamp. Used only if InitialPosition == InitialPostionEnum.Timestamp
+        /// This value will be converted to UTC-time.
         /// </summary>
-        public DateTime? InitialPositionTimestamp { get; set; }
+        public DateTime? InitialPositionTimestamp
+        {
+            get => _initialPositionTimestamp;
+            set
+            {
+                if (!value.HasValue)
+                {
+                    _initialPositionTimestamp = value;
+                    return;
+                }
+
+                if (value.Value.Kind == DateTimeKind.Unspecified)
+                {
+                    throw new ArgumentException("InitialPositionTimestamp must have defined DateTimeKind");
+                }
+
+                if (value.Value.Kind == DateTimeKind.Local)
+                {
+                    _initialPositionTimestamp = value.Value.ToUniversalTime();
+                }
+                else
+                {
+                    _initialPositionTimestamp = value;
+                }
+            }
+        }
 
         /// <summary>
         /// A helper method to load the common config parameters.
@@ -77,7 +106,7 @@ namespace Amazon.KinesisTap.Core
         /// <param name="source">The source to be configured</param>
         public static void LoadCommonSourceConfig(IConfiguration config, EventSource<T> source)
         {
-            InitialPositionEnum initialPosition = InitialPositionEnum.EOS;
+            InitialPositionEnum initialPosition = InitialPositionEnum.Bookmark;
             string initialPositionConfig = config["InitialPosition"];
             if (!string.IsNullOrEmpty(initialPositionConfig))
             {
@@ -102,7 +131,11 @@ namespace Amazon.KinesisTap.Core
 
                         try
                         {
-                            source.InitialPositionTimestamp = DateTime.Parse(initialPositionTimeStamp, null, System.Globalization.DateTimeStyles.RoundtripKind);
+                            var timeZone = Utility.ParseTimeZoneKind(config["TimeZoneKind"]);
+                            var timestamp = DateTime.Parse(initialPositionTimeStamp, null, System.Globalization.DateTimeStyles.RoundtripKind);
+                            source.InitialPositionTimestamp = timeZone == DateTimeKind.Utc
+                                ? DateTime.SpecifyKind(timestamp, DateTimeKind.Utc)
+                                : DateTime.SpecifyKind(timestamp, DateTimeKind.Local).ToUniversalTime();
                         }
                         catch
                         {
@@ -152,7 +185,11 @@ namespace Amazon.KinesisTap.Core
         /// <returns></returns>
         protected string GetBookmarkFilePath()
         {
-            return Path.Combine(Utility.GetKinesisTapProgramDataPath(), ConfigConstants.BOOKMARKS, $"{this.Id}.bm");
+            var sessionId = _context.SessionId;
+            string multipleConfigurationSuffix = sessionId == 0 ? string.Empty : $"_{sessionId}";
+            return Path.Combine(Utility.GetKinesisTapProgramDataPath(), ConfigConstants.BOOKMARKS, $"{$"{Id}"}{multipleConfigurationSuffix}.bm");
         }
+
+        public Type GetOutputType() => typeof(T);
     }
 }

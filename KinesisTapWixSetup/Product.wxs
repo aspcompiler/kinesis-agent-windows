@@ -24,7 +24,7 @@
   <!-- We will always do major upgrade.-->
   <!-- GUID are automated generated for IDs of "*" using Key information -->
   <!-- It is important not to change the UpgradeCode -->
-  <Product Id="*"
+  <Product Id="ADAB3982-68AA-4B45-AE09-7B9C03F3EBD3"
     Name="$(var.ProductName)"
     Language="1033"
     Version="$(var.ProductVersion)"
@@ -94,7 +94,7 @@
       Id="InstallNLog.SetProperty"
       Property="InstallNLog"
       Value="INSTALLFOLDER=[INSTALLFOLDER]" />
-    <!-- .net custom action that install NLog.xml. Update the binding policy during upgrade. -->
+    <!-- .net custom action that install NLog.xml.-->
     <CustomAction
       Id="InstallNLog"
       BinaryKey="KinesisTapMsiCustomAction"
@@ -105,17 +105,30 @@
       Id="UpgradePowershellInstalledKinesisTap.SetProperty"
       Property="UpgradePowershellInstalledKinesisTap"
       Value="SERVICENAME=$(var.ServiceName)" />
-    <!-- .net custom action that upgrade from Powershell installed KinesisTap. Update the binding policy during upgrade. -->
+    <!-- .net custom action that upgrade from Powershell installed KinesisTap.-->
     <CustomAction
       Id="UpgradePowershellInstalledKinesisTap"
       BinaryKey="KinesisTapMsiCustomAction"
       DllEntry="UpgradePowershellInstalledKinesisTap"
       Impersonate="no"
       Execute="deferred" />
-    
+    <CustomAction
+      Id="EnsureKinesisTapNotRunning.SetProperty"
+      Property="EnsureKinesisTapNotRunning"
+      Value="SERVICENAME=$(var.ServiceName)" />
+    <!-- .net custom action that upgrade from Powershell installed KinesisTap. -->
+    <CustomAction
+      Id="EnsureKinesisTapNotRunning"
+      BinaryKey="KinesisTapMsiCustomAction"
+      DllEntry="EnsureKinesisTapNotRunning"
+      Impersonate="no"
+      Execute="deferred" />
+
     <!-- Schedule custom actions in the installation pipeline. -->
     <InstallExecuteSequence>
       <!-- Run the following custom action only on install or upgrade. -->
+      <Custom Action='EnsureKinesisTapNotRunning.SetProperty' After='CostFinalize'>NOT REMOVE</Custom>
+      <Custom Action='EnsureKinesisTapNotRunning' After='StopServices'>NOT REMOVE</Custom>
       <Custom Action='UpgradePowershellInstalledKinesisTap.SetProperty' After='CostFinalize'>NOT REMOVE</Custom>
       <Custom Action='UpgradePowershellInstalledKinesisTap' After='InstallFiles'>NOT REMOVE</Custom>
       <Custom Action='InstallAppSettings.SetProperty' After='CostFinalize'>NOT REMOVE</Custom>
@@ -146,7 +159,7 @@
       <!-- Use AWSKinesisTap.exe to key the ServiceInstall-->
       <Component Id="ProductComponent"
         Guid="{8DBCA2DE-9D6E-47AD-8EBE-1B6384D327EF}">
-        <File Id="KinesisTapExe" Name="AWSKinesisTap.exe" DiskId="1" Source="$(var.Amazon.KinesisTap.TargetDir)\AWSKinesisTap.exe" Vital="yes" KeyPath="yes" />
+        <File Id="KinesisTapExe" Name="AWSKinesisTap.exe" DiskId="1" Source="$(var.SolutionDir)Amazon.KinesisTap\bin\Release\AWSKinesisTap.exe" Vital="yes" KeyPath="yes" />
 
         <!-- Tell WiX to install the Service -->
         <ServiceInstall
@@ -163,6 +176,7 @@
             ThirdFailureActionType="restart"
             ResetPeriodInDays="1"
             RestartServiceDelayInSeconds="20" />
+          <ServiceConfig DelayedAutoStart="yes" OnInstall="yes" OnReinstall ="yes" />
         </ServiceInstall>
         
         <!-- Tell WiX to start the Service -->
@@ -172,7 +186,7 @@
           Stop="both"
           Remove="uninstall"
           Name="$(var.ServiceName)"
-          Wait="yes" />
+          Wait="no" />
 
       </Component>
     </ComponentGroup>
